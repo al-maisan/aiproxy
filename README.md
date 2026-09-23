@@ -103,6 +103,30 @@ matched against error bodies; deliberately specific to avoid false positives).
 the primary), optional `fallback` (model id at the fallback; defaults to
 `requested`).
 
+`[stats]` — `disabled` (default `false`) turns off the endpoints below;
+`buckets` overrides the latency histogram bounds in seconds.
+
+## Statistics
+
+`aiproxy` keeps lightweight in-process counters: which upstream served each
+proxied chat request, why a fallback happened, and how long upstream attempts
+took. Two endpoints expose them (both require `client_token` when configured,
+and are omitted entirely when `[stats].disabled = true`):
+
+- `GET /stats` — JSON: per-upstream attempts/served counts and served share,
+  per-outcome/status breakdown, plus latency sum/avg/min/max and p50/p90/p99
+  estimates (histogram-interpolated, so approximate).
+- `GET /metrics` — Prometheus text exposition (`aiproxy_requests_total`,
+  `aiproxy_upstream_attempts_total`, and the
+  `aiproxy_upstream_request_duration_seconds` histogram).
+
+A request is attributed to the upstream that served it; a fallback is counted
+under the fallback with a `reason` label (`quota`, `connection_error`,
+`unrouted`). Latency is measured to the end of the response body, so a streamed
+response is timed to completion; a request abandoned by the client is recorded
+as `client_abort` (status 499) rather than an upstream failure. Counters are
+in-process and reset on restart.
+
 ## Security
 
 - Binds to loopback by default. Set `client_token` before exposing it; readiness

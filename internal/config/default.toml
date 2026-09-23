@@ -67,3 +67,9 @@ primary   = "deepseek-v4.1-flash"
 [[routes]]
 requested = "z-ai/glm-5.3"
 primary   = "glm-5.3"
+
+[stats]
+# Set disabled = true to omit the /stats and /metrics endpoints.
+disabled = false
+# Latency histogram upper bounds in seconds (empty uses built-in defaults).
+# buckets = [0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60]

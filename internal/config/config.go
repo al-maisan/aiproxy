@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
@@ -39,6 +40,8 @@ type Config struct {
 	StripFields []string `toml:"strip_fields"`
 	// Quota configures how upstream quota exhaustion is detected.
 	Quota Quota `toml:"quota"`
+	// Stats configures the request statistics endpoints.
+	Stats Stats `toml:"stats"`
 }
 
 // Log configures the logger.
@@ -99,6 +102,15 @@ func (r Route) FallbackModel() string {
 type Quota struct {
 	Statuses []int    `toml:"statuses"`
 	Patterns []string `toml:"patterns"`
+}
+
+// Stats configures the request statistics endpoints. When Disabled is set,
+// neither /stats nor /metrics is registered.
+type Stats struct {
+	Disabled bool `toml:"disabled"`
+	// Buckets are latency histogram upper bounds in seconds. Empty means the
+	// built-in defaults are used.
+	Buckets []float64 `toml:"buckets"`
 }
 
 // Duration is a time.Duration that unmarshals from strings such as "15s".
@@ -292,6 +304,19 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.ShutdownTimeout.Std() <= 0 {
 		errs = append(errs, errors.New("server.shutdown_timeout: must be greater than zero"))
+	}
+
+	for i, b := range c.Stats.Buckets {
+		if math.IsInf(b, 0) || math.IsNaN(b) || b <= 0 {
+			errs = append(errs, fmt.Errorf("stats.buckets[%d]: must be a finite value greater than zero", i))
+			continue
+		}
+		for j := 0; j < i; j++ {
+			if c.Stats.Buckets[j] == b {
+				errs = append(errs, fmt.Errorf("stats.buckets[%d]: duplicate bucket %g", i, b))
+				break
+			}
+		}
 	}
 
 	return errors.Join(errs...)

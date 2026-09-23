@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -188,6 +189,9 @@ func TestValidateErrors(t *testing.T) {
 		{"zero upstream header timeout", func(c *Config) { c.Server.UpstreamHeaderTimeout = 0 }, "server.upstream_header_timeout"},
 		{"zero dial timeout", func(c *Config) { c.Server.DialTimeout = 0 }, "server.dial_timeout"},
 		{"zero shutdown timeout", func(c *Config) { c.Server.ShutdownTimeout = 0 }, "server.shutdown_timeout"},
+		{"bad stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, 0} }, "stats.buckets[1]"},
+		{"duplicate stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, 1} }, "duplicate bucket"},
+		{"infinite stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, math.Inf(1)} }, "stats.buckets[1]"},
 	}
 
 	for _, tt := range tests {
@@ -281,6 +285,31 @@ func TestValidateRejectsBlankClientTokenWithoutMutating(t *testing.T) {
 	}
 	if cfg.ClientToken != "   " {
 		t.Fatalf("Validate() mutated ClientToken to %q; it must stay pure", cfg.ClientToken)
+	}
+}
+
+func TestLoadStats(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+listen = "127.0.0.1:1"
+
+[stats]
+disabled = true
+buckets = [0.5, 1, 2.5]
+`))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Stats.Disabled {
+		t.Error("Stats.Disabled = false, want true")
+	}
+	if len(cfg.Stats.Buckets) != 3 || cfg.Stats.Buckets[2] != 2.5 {
+		t.Errorf("Stats.Buckets = %v", cfg.Stats.Buckets)
+	}
+}
+
+func TestDefaultStatsEnabled(t *testing.T) {
+	if Default().Stats.Disabled {
+		t.Error("stats should be enabled by default")
 	}
 }
 

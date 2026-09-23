@@ -23,6 +23,7 @@ import (
 	"github.com/al-maisan/aiproxy/internal/config"
 	"github.com/al-maisan/aiproxy/internal/keys"
 	"github.com/al-maisan/aiproxy/internal/quota"
+	"github.com/al-maisan/aiproxy/internal/stats"
 )
 
 type ctxKey int
@@ -74,6 +75,7 @@ type Proxy struct {
 	client *http.Client
 	routes map[string]config.Route
 	strip  map[string]struct{}
+	stats  *stats.Collector
 
 	// readyMu guards readyState, the last observed readiness per upstream.
 	// The state is tracked so /readyz can log transitions instead of logging
@@ -108,6 +110,11 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 		strip[f] = struct{}{}
 	}
 
+	collector := stats.New()
+	if len(cfg.Stats.Buckets) > 0 {
+		collector = stats.NewWithBuckets(cfg.Stats.Buckets)
+	}
+
 	return &Proxy{
 		cfg:        cfg,
 		log:        log,
@@ -116,6 +123,7 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 		client:     &http.Client{Transport: transport},
 		routes:     routes,
 		strip:      strip,
+		stats:      collector,
 		readyState: make(map[string]bool),
 	}, nil
 }
@@ -126,10 +134,18 @@ func (p *Proxy) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", p.handleHealth)
 	mux.Handle("GET /readyz", p.instrument(p.authenticate(http.HandlerFunc(p.handleReady))))
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
-		mux.Handle("POST "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleChat))))
+		mux.Handle("POST "+path, p.instrument(p.authenticateWith(http.HandlerFunc(p.handleChat), func() {
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusUnauthorized)
+		})))
 	}
 	for _, path := range []string{"/v1/models", "/models"} {
 		mux.Handle("GET "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleModels))))
+	}
+	if !p.cfg.Stats.Disabled {
+		// Stats are operator-facing, so they require the client token when one
+		// is configured, like the other proxied routes.
+		mux.Handle("GET /stats", p.instrument(p.authenticate(http.HandlerFunc(p.handleStats))))
+		mux.Handle("GET /metrics", p.instrument(p.authenticate(http.HandlerFunc(p.handleMetrics))))
 	}
 	return mux
 }
@@ -175,6 +191,16 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, status, map[string]any{"ready": ready, "checks": checks})
 }
 
+func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, p.stats.Snapshot())
+}
+
+func (p *Proxy) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, p.stats.Prometheus())
+}
+
 // noteReadiness records an upstream's readiness and logs it only when the state
 // changes, so a health checker polling a misconfigured deployment does not
 // flood the logs. State is keyed by role (primary/fallback), not the
@@ -212,13 +238,16 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusRequestTimeout)
 			p.writeError(w, http.StatusRequestTimeout, "request body read timed out")
 			return
 		}
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	if int64(len(body)) > p.cfg.Server.MaxBodyBytes {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusRequestEntityTooLarge)
 		p.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
@@ -227,15 +256,18 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := dec.Decode(&payload); err != nil {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "unexpected data after JSON request body")
 		return
 	}
 	model, _ := payload["model"].(string)
 	if strings.TrimSpace(model) == "" {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "missing model")
 		return
 	}
@@ -245,7 +277,7 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	route, routed := p.routes[model]
 	if !routed {
 		log.Debug("no route for model; using fallback", "upstream", p.cfg.Upstreams.Fallback.Name)
-		p.forwardFallback(w, r, body, log, "unrouted")
+		p.forwardFallback(w, r, body, log, stats.ReasonUnrouted)
 		return
 	}
 
@@ -256,6 +288,7 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 		fallbackBody, err = cloneWithModel(payload, route.FallbackModel(), nil)
 		if err != nil {
 			log.Error("failed to encode fallback request", "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusInternalServerError)
 			p.writeError(w, http.StatusInternalServerError, "failed to encode request")
 			return
 		}
@@ -264,32 +297,42 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	primaryBody, err := p.encodePrimary(payload, route.Primary)
 	if err != nil {
 		log.Error("failed to encode primary request", "err", err)
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusInternalServerError)
 		p.writeError(w, http.StatusInternalServerError, "failed to encode request")
 		return
 	}
 
+	primaryStart := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
 	if err != nil {
+		if clientGone(r, err) {
+			log.Info("client aborted request", "upstream", p.cfg.Upstreams.Primary.Name)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, "", statusClientClosedRequest)
+			return
+		}
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("primary api key unavailable", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "primary upstream api key unavailable")
 			return
 		}
+		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 		if !p.cfg.FallbackOnConnErr() {
 			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "primary upstream request failed")
 			return
 		}
 		log.Warn("primary unreachable; falling back",
 			"upstream", p.cfg.Upstreams.Primary.Name, "fallback", p.cfg.Upstreams.Fallback.Name, "err", err)
-		p.forwardFallback(w, r, fallbackBody, log, "connection_error")
+		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonConnectionError)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Debug("served by primary", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
-		p.stream(w, resp)
+		p.finishStream(w, r, resp, primaryStart, stats.UpstreamPrimary, "", log)
 		return
 	}
 
@@ -300,29 +343,71 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 			"status", resp.StatusCode,
 			"fallback", p.cfg.Upstreams.Fallback.Name)
 		log.Debug("primary quota response detail", "detail", safeDetail(errBody))
-		p.forwardFallback(w, r, fallbackBody, log, "quota")
+		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
+		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonQuota)
 		return
 	}
 
 	log.Warn("primary error; passing through", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+	p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
+	if clientGone(r, nil) {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, "", statusClientClosedRequest)
+		return
+	}
+	p.stats.ObserveRequest(stats.UpstreamPrimary, stats.UpstreamErr, "", resp.StatusCode)
 	writeUpstream(w, resp, errBody)
 }
 
+// finishStream streams resp to the client, then records the attempt latency and
+// the final outcome. Latency is recorded after the body has been copied, so a
+// long SSE response is timed to completion rather than to first byte. The
+// outcome is ClientAbort if the client disconnected (its context is cancelled
+// or the write to it failed), UpstreamErr if the upstream body failed, and
+// Success only when the body completed.
+func (p *Proxy) finishStream(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, upstream, reason string, log *slog.Logger) {
+	err := p.stream(w, resp)
+	p.stats.ObserveLatency(upstream, time.Since(start))
+
+	status := resp.StatusCode
+	ok := status >= 200 && status < 300
+	switch {
+	case err == nil && ok:
+		p.stats.ObserveRequest(upstream, stats.Success, reason, status)
+	case errors.Is(err, errClientWrite) || (err != nil && clientGone(r, err)):
+		log.Info("client aborted while streaming", "upstream", upstream)
+		p.stats.ObserveRequest(upstream, stats.ClientAbort, reason, status)
+	default:
+		if err != nil {
+			log.Error("upstream stream failed", "upstream", upstream, "err", err)
+		}
+		p.stats.ObserveRequest(upstream, stats.UpstreamErr, reason, status)
+	}
+}
+
 func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
+	start := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
 	if err != nil {
+		if clientGone(r, err) {
+			log.Info("client aborted request", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, reason, statusClientClosedRequest)
+			return
+		}
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("fallback api key unavailable", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "fallback upstream api key unavailable")
 			return
 		}
+		p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
 		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
 		return
 	}
 	log.Info("served by fallback", "upstream", p.cfg.Upstreams.Fallback.Name, "status", resp.StatusCode, "reason", reason)
 	defer func() { _ = resp.Body.Close() }()
-	p.stream(w, resp)
+	p.finishStream(w, r, resp, start, stats.UpstreamFallback, reason, log)
 }
 
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -348,7 +433,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
-	p.stream(w, resp)
+	_ = p.stream(w, resp)
 }
 
 // encodePrimary clones the payload for the primary upstream, dropping
@@ -389,7 +474,14 @@ func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte
 	return p.client.Do(req)
 }
 
-func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) {
+// errClientWrite marks a failure to write to the client's response. It is
+// distinct from an upstream read error: the client is gone, not the upstream.
+var errClientWrite = errors.New("client write failed")
+
+// stream copies the upstream response body to the client. It returns nil only
+// when the body was fully consumed; a failed read is returned as an upstream
+// error, and a failed write is wrapped in errClientWrite.
+func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) error {
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
@@ -399,14 +491,17 @@ func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return fmt.Errorf("%w: %w", errClientWrite, werr)
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }
@@ -428,6 +523,22 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// statusClientClosedRequest is the non-standard 499 status used to classify a
+// request abandoned by the client.
+const statusClientClosedRequest = 499
+
+// clientGone reports whether err (or the request context) indicates the client
+// disconnected, as opposed to an upstream failure. The server cancels the
+// request context when the client hangs up; an upstream timeout, by contrast,
+// leaves the context live and must not be treated as a client abort. err may be
+// nil, in which case only the context is consulted.
+func clientGone(r *http.Request, err error) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (p *Proxy) instrument(next http.Handler) http.Handler {
@@ -464,19 +575,35 @@ func (p *Proxy) instrument(next http.Handler) http.Handler {
 }
 
 func (p *Proxy) authenticate(next http.Handler) http.Handler {
+	return p.authenticateWith(next, nil)
+}
+
+// authenticateWith wraps next with authentication. If onReject is non-nil it is
+// called before the 401 is written (used to record unauthorized attempts).
+func (p *Proxy) authenticateWith(next http.Handler, onReject func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p.cfg.ClientToken != "" {
-			// Compare fixed-size digests to avoid a length-dependent branch.
-			got := sha256.Sum256([]byte(bearerToken(r.Header.Get("Authorization"))))
-			want := sha256.Sum256([]byte(p.cfg.ClientToken))
-			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
-				p.writeError(w, http.StatusUnauthorized, "unauthorized")
-				return
+		if !p.authorized(r) {
+			if onReject != nil {
+				onReject()
 			}
+			w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
+			p.writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// authorized reports whether the request carries valid credentials. It is true
+// for every request when no client_token is configured.
+func (p *Proxy) authorized(r *http.Request) bool {
+	if p.cfg.ClientToken == "" {
+		return true
+	}
+	// Compare fixed-size digests to avoid a length-dependent branch.
+	got := sha256.Sum256([]byte(bearerToken(r.Header.Get("Authorization"))))
+	want := sha256.Sum256([]byte(p.cfg.ClientToken))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 type recorder struct {
