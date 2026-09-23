@@ -38,6 +38,52 @@ func TestNewRejectsInvalidStatus(t *testing.T) {
 	}
 }
 
+func TestMatchReason(t *testing.T) {
+	d, err := New([]int{402, 429}, []string{`(?i)quota`, `(?i)usage limit`})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Status rule wins and names the status code.
+	r, ok := d.Match(429, []byte("anything"))
+	if !ok || r.Source != "status" || r.Value != "429" {
+		t.Fatalf("status match = %+v, %v", r, ok)
+	}
+	if got := r.String(); got != "status=429" {
+		t.Fatalf("String() = %q", got)
+	}
+
+	// Pattern rule names the pattern.
+	r, ok = d.Match(400, []byte(`{"error":"Quota exceeded"}`))
+	if !ok || r.Source != "pattern" || r.Value != "(?i)quota" {
+		t.Fatalf("pattern match = %+v, %v", r, ok)
+	}
+	if got := r.String(); got != "pattern=(?i)quota" {
+		t.Fatalf("String() = %q", got)
+	}
+
+	// A match past the first 300 bytes is still reported.
+	pad := make([]byte, 400)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	r, ok = d.Match(400, append(pad, []byte(" monthly usage limit")...))
+	if !ok || r.Source != "pattern" || r.Value != "(?i)usage limit" {
+		t.Fatalf("late pattern match = %+v, %v", r, ok)
+	}
+
+	// No match.
+	if r, ok := d.Match(500, []byte("internal error")); ok {
+		t.Fatalf("unexpected match: %+v", r)
+	}
+}
+
+func TestReasonStringUnknown(t *testing.T) {
+	if got := (Reason{}).String(); got != "unknown" {
+		t.Fatalf("empty Reason.String() = %q, want unknown", got)
+	}
+}
+
 func TestNewRejectsInvalidPattern(t *testing.T) {
 	if _, err := New(nil, []string{"("}); err == nil {
 		t.Fatal("expected error for invalid pattern")

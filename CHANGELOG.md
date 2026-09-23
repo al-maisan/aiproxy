@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Quota fallbacks now log which configured rule matched (the status code or the
+  pattern) at the default `info` level, so a fallback triggered by an upstream
+  `400` is diagnosable without lowering the log level. The raw response body
+  remains `debug`-only, since a provider error may echo request content.
+
 ## [0.3.0] - 2026-09-23
 
 ### Added

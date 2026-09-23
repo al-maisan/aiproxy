@@ -4,12 +4,29 @@ package quota
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 )
 
 // Detector decides whether an upstream response indicates exhausted quota.
 type Detector struct {
 	statuses map[int]struct{}
 	patterns []*regexp.Regexp
+}
+
+// Reason identifies the rule that classified a response as quota exhaustion. It
+// names only the configured status or pattern — never response content — so it
+// is safe to log at any level.
+type Reason struct {
+	Source string // "status" or "pattern"
+	Value  string // the status code, or the pattern that matched
+}
+
+// String renders the reason as "source=value".
+func (r Reason) String() string {
+	if r.Source == "" {
+		return "unknown"
+	}
+	return r.Source + "=" + r.Value
 }
 
 // New compiles a detector from a set of HTTP status codes and body patterns.
@@ -34,16 +51,24 @@ func New(statuses []int, patterns []string) (*Detector, error) {
 	return d, nil
 }
 
-// IsQuota reports whether the status/body combination represents exhausted
-// quota. A configured status always matches; otherwise the body is scanned.
-func (d *Detector) IsQuota(status int, body []byte) bool {
+// Match reports whether the status/body combination represents exhausted quota
+// and, if so, which configured rule matched. A configured status matches
+// regardless of body; otherwise the body is scanned against the patterns.
+func (d *Detector) Match(status int, body []byte) (Reason, bool) {
 	if _, ok := d.statuses[status]; ok {
-		return true
+		return Reason{Source: "status", Value: strconv.Itoa(status)}, true
 	}
 	for _, re := range d.patterns {
 		if re.Match(body) {
-			return true
+			return Reason{Source: "pattern", Value: re.String()}, true
 		}
 	}
-	return false
+	return Reason{}, false
+}
+
+// IsQuota reports whether the status/body combination represents exhausted
+// quota. A configured status always matches; otherwise the body is scanned.
+func (d *Detector) IsQuota(status int, body []byte) bool {
+	_, ok := d.Match(status, body)
+	return ok
 }

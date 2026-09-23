@@ -236,6 +236,87 @@ func TestQuotaPatternTriggersFallbackWithoutStatusMatch(t *testing.T) {
 	}
 }
 
+// quotaFallbackLog runs a single routed request whose primary returns the
+// given status/body and returns the decoded JSON log entry for the quota
+// fallback warning. Using a JSON handler keeps the assertions independent of
+// the text log format.
+func quotaFallbackLog(t *testing.T, status int, primaryBody string) map[string]any {
+	t.Helper()
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, primaryBody)
+	})
+	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "ok")
+	})
+
+	var buf bytes.Buffer
+	log := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+	if resp.StatusCode != http.StatusOK || body != "ok" {
+		t.Fatalf("status=%d body=%q, want fallback served", resp.StatusCode, body)
+	}
+
+	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("log line is not JSON: %v\n%s", err, line)
+		}
+		if m["msg"] == "primary quota reached; falling back" {
+			return m
+		}
+	}
+	t.Fatalf("no quota-fallback warning logged at Info:\n%s", buf.String())
+	return nil
+}
+
+func TestQuotaFallbackLogsMatchedPattern(t *testing.T) {
+	// A 400 that matches a quota pattern (the production case: OpenCode Go
+	// rejects a model with status 400) must name the matched rule at the
+	// default Info level, without logging the response body.
+	entry := quotaFallbackLog(t, http.StatusBadRequest,
+		`{"error":{"message":"You exceeded your monthly quota"}}`)
+
+	matched, ok := entry["matched"].(string)
+	if !ok || !strings.HasPrefix(matched, "pattern=") {
+		t.Fatalf("matched = %v, want a pattern= reason", entry["matched"])
+	}
+	// The raw body can echo prompt content and must stay at Debug.
+	if _, present := entry["detail"]; present {
+		t.Fatalf("raw rejection body leaked at Info: %v", entry["detail"])
+	}
+}
+
+func TestQuotaFallbackLogsMatchedStatus(t *testing.T) {
+	entry := quotaFallbackLog(t, http.StatusPaymentRequired, "no quota wording here")
+
+	if got := entry["matched"]; got != "status=402" {
+		t.Fatalf("matched = %v, want status=402", got)
+	}
+}
+
+func TestQuotaFallbackMatchBeyondDetailWindow(t *testing.T) {
+	// The pattern is matched against up to 1 MiB, but the raw detail is
+	// truncated to its first 300 runes. A match past that point must still be
+	// reported via the matched rule.
+	padding := strings.Repeat("x", 400)
+	entry := quotaFallbackLog(t, http.StatusBadRequest,
+		`{"error":"`+padding+` Monthly quota exceeded"}`)
+
+	matched, ok := entry["matched"].(string)
+	if !ok || !strings.HasPrefix(matched, "pattern=") {
+		t.Fatalf("late match not reported: matched = %v", entry["matched"])
+	}
+}
+
 func TestNonQuotaPrimaryErrorPassesThrough(t *testing.T) {
 	primary := newFake(t, func(w http.ResponseWriter, _ int) {
 		w.WriteHeader(http.StatusBadRequest)
