@@ -1,11 +1,13 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/al-maisan/aiproxy/internal/stats"
 )
@@ -185,6 +187,91 @@ func TestStatsCustomBuckets(t *testing.T) {
 	_, body := get(t, srv.URL+"/metrics")
 	if !strings.Contains(body, `le="0.01"`) || !strings.Contains(body, `le="0.02"`) {
 		t.Fatalf("custom buckets missing from metrics:\n%s", body)
+	}
+}
+
+func TestStatsKeyErrorDoesNotRecordAttempt(t *testing.T) {
+	primary := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("primary must not be reached without a key")
+	})
+	fallback := newFake(t, nil)
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_STATS_UNSET_PRIMARY"
+	srv := newProxy(t, cfg)
+
+	post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+
+	snap := statsSnapshot(t, srv.URL)
+	// No request was sent, so no latency/attempt series for the primary.
+	for _, u := range snap.Upstreams {
+		if u.Upstream == stats.UpstreamPrimary {
+			t.Fatalf("primary should have no attempts on key error, got %+v", u)
+		}
+	}
+	if got := requestCountFor(snap, stats.UpstreamNone, ""); got != 1 {
+		t.Fatalf("unavailable count = %d, want 1", got)
+	}
+}
+
+func TestStatsStreamDurationMeasuresFullBody(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < 4; i++ {
+			_, _ = io.WriteString(w, "data: x\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	fallback := newFake(t, nil)
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	srv := newProxy(t, cfg)
+
+	post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+
+	snap := statsSnapshot(t, srv.URL)
+	if len(snap.Upstreams) != 1 {
+		t.Fatalf("upstreams = %+v", snap.Upstreams)
+	}
+	// Four 50ms chunks => at least ~150ms measured to stream completion.
+	if got := snap.Upstreams[0].SumSeconds; got < 0.15 {
+		t.Fatalf("streamed duration = %v, want >= 0.15 (measured to completion)", got)
+	}
+}
+
+func TestStatsRecordsClientAbort(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		// Slow response so the client can abort while the proxy waits.
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, "ok")
+	})
+	fallback := newFake(t, nil)
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	srv := newProxy(t, cfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		srv.URL+"/v1/chat/completions", strings.NewReader(`{"model":"req-model"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	_, _ = http.DefaultClient.Do(req) // expected to fail with context deadline
+
+	snap := statsSnapshot(t, srv.URL)
+	if got := requestCountFor(snap, stats.UpstreamNone, ""); got == 0 {
+		t.Fatalf("client abort not recorded: %+v", snap.Requests)
+	}
+	for _, r := range snap.Requests {
+		if r.Outcome != string(stats.ClientAbort) {
+			t.Fatalf("outcome = %q, want client_abort", r.Outcome)
+		}
+	}
+	// It must not be misreported as an unavailable/fallback outage.
+	if got := requestCountFor(snap, stats.UpstreamFallback, stats.ReasonConnectionError); got != 0 {
+		t.Fatalf("client abort recorded as connection_error fallback: %d", got)
 	}
 }
 

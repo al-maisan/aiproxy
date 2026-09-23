@@ -49,7 +49,7 @@ func TestObserveLatencyStats(t *testing.T) {
 		t.Fatalf("upstreams = %d, want 1", len(snap.Upstreams))
 	}
 	u := snap.Upstreams[0]
-	if u.Upstream != UpstreamPrimary || u.Count != 3 {
+	if u.Upstream != UpstreamPrimary || u.Attempts != 3 {
 		t.Fatalf("upstream stat = %+v", u)
 	}
 	if u.MinSeconds != 0.25 || u.MaxSeconds != 4.0 {
@@ -74,6 +74,32 @@ func quantileOf(u *UpstreamStat, q float64) float64 {
 		}
 	}
 	return -1
+}
+
+func TestPercentServedFromServedNotAttempts(t *testing.T) {
+	c := New()
+	// One request falls back: primary attempted then fallback served.
+	c.ObserveLatency(UpstreamPrimary, 0)
+	c.ObserveLatency(UpstreamFallback, 0)
+	c.ObserveRequest(UpstreamFallback, Success, ReasonQuota, 200)
+
+	snap := c.Snapshot()
+	byName := map[string]UpstreamStat{}
+	for _, u := range snap.Upstreams {
+		byName[u.Upstream] = u
+	}
+	// Primary was attempted but served nothing: 0% served.
+	if p := byName[UpstreamPrimary].PercentServed; p != 0 {
+		t.Fatalf("primary percent_served = %v, want 0", p)
+	}
+	// Fallback served the only request: 100%.
+	if p := byName[UpstreamFallback].PercentServed; p != 100 {
+		t.Fatalf("fallback percent_served = %v, want 100", p)
+	}
+	// Attempts still record the primary attempt.
+	if a := byName[UpstreamPrimary].Attempts; a != 1 {
+		t.Fatalf("primary attempts = %d, want 1", a)
+	}
 }
 
 func TestPrometheusFormat(t *testing.T) {

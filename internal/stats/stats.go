@@ -13,13 +13,15 @@ import (
 type Outcome string
 
 const (
-	// Success means an upstream returned a 2xx response.
+	// Success means an upstream returned a 2xx response that streamed fully.
 	Success Outcome = "success"
-	// UpstreamErr means an upstream returned an error response that was passed
-	// through to the client.
+	// UpstreamErr means an upstream returned an error response, or its response
+	// stream broke before completing.
 	UpstreamErr Outcome = "upstream_error"
 	// ClientErr means the request was rejected before any upstream was called.
 	ClientErr Outcome = "client_error"
+	// ClientAbort means the client disconnected before the request completed.
+	ClientAbort Outcome = "client_abort"
 	// Unavailable means no upstream could serve the request (missing key,
 	// connection failure, or encoding failure).
 	Unavailable Outcome = "unavailable"
@@ -158,7 +160,9 @@ func (c *Collector) ObserveRequest(upstream string, outcome Outcome, reason stri
 }
 
 // ObserveLatency records the duration of one upstream attempt. A request that
-// falls back produces two observations: one per attempted upstream.
+// falls back produces two observations: one per attempted upstream. It must
+// only be called when a request was actually sent (not, for example, when key
+// resolution failed).
 func (c *Collector) ObserveLatency(upstream string, d time.Duration) {
 	if upstream == "" || upstream == UpstreamNone {
 		return
@@ -171,4 +175,55 @@ func (c *Collector) ObserveLatency(upstream string, d time.Duration) {
 		c.hists[upstream] = h
 	}
 	h.observe(d.Seconds())
+}
+
+// view is a consistent point-in-time copy of the collector taken under a single
+// lock, so request counters and latency histograms cannot disagree within one
+// render.
+type view struct {
+	uptime float64
+	total  uint64
+	served map[string]uint64
+	series []seriesSample
+	hists  map[string]histogram
+}
+
+type seriesSample struct {
+	key   seriesKey
+	count uint64
+}
+
+// snapshot copies the collector state under one lock.
+func (c *Collector) snapshot() view {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	v := view{
+		uptime: time.Since(c.start).Seconds(),
+		served: make(map[string]uint64),
+		hists:  make(map[string]histogram, len(c.hists)),
+	}
+	v.series = make([]seriesSample, 0, len(c.series))
+	for k, n := range c.series {
+		v.total += n
+		v.served[k.upstream] += n
+		v.series = append(v.series, seriesSample{key: k, count: n})
+	}
+	sort.Slice(v.series, func(i, j int) bool {
+		a, b := v.series[i].key, v.series[j].key
+		if a.upstream != b.upstream {
+			return a.upstream < b.upstream
+		}
+		if a.outcome != b.outcome {
+			return a.outcome < b.outcome
+		}
+		if a.reason != b.reason {
+			return a.reason < b.reason
+		}
+		return a.status < b.status
+	})
+	for u, h := range c.hists {
+		v.hists[u] = *h
+	}
+	return v
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
@@ -306,8 +307,15 @@ func (c *Config) Validate() error {
 	}
 
 	for i, b := range c.Stats.Buckets {
-		if !(b > 0) {
-			errs = append(errs, fmt.Errorf("stats.buckets[%d]: must be greater than zero", i))
+		if math.IsInf(b, 0) || math.IsNaN(b) || b <= 0 {
+			errs = append(errs, fmt.Errorf("stats.buckets[%d]: must be a finite value greater than zero", i))
+			continue
+		}
+		for j := 0; j < i; j++ {
+			if c.Stats.Buckets[j] == b {
+				errs = append(errs, fmt.Errorf("stats.buckets[%d]: duplicate bucket %g", i, b))
+				break
+			}
 		}
 	}
 

@@ -134,7 +134,9 @@ func (p *Proxy) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", p.handleHealth)
 	mux.Handle("GET /readyz", p.instrument(p.authenticate(http.HandlerFunc(p.handleReady))))
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
-		mux.Handle("POST "+path, p.instrument(p.chatHandler()))
+		mux.Handle("POST "+path, p.instrument(p.authenticateWith(http.HandlerFunc(p.handleChat), func() {
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusUnauthorized)
+		})))
 	}
 	for _, path := range []string{"/v1/models", "/models"} {
 		mux.Handle("GET "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleModels))))
@@ -142,8 +144,8 @@ func (p *Proxy) Handler() http.Handler {
 	if !p.cfg.Stats.Disabled {
 		// Stats are operator-facing, so they require the client token when one
 		// is configured, like the other proxied routes.
-		mux.Handle("GET /stats", p.authenticate(http.HandlerFunc(p.handleStats)))
-		mux.Handle("GET /metrics", p.authenticate(http.HandlerFunc(p.handleMetrics)))
+		mux.Handle("GET /stats", p.instrument(p.authenticate(http.HandlerFunc(p.handleStats))))
+		mux.Handle("GET /metrics", p.instrument(p.authenticate(http.HandlerFunc(p.handleMetrics))))
 	}
 	return mux
 }
@@ -191,20 +193,6 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 
 func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, p.stats.Snapshot())
-}
-
-// chatHandler authenticates and serves a chat request. Unauthorized attempts are
-// recorded as client errors so they appear in the request statistics.
-func (p *Proxy) chatHandler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !p.authorized(r) {
-			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusUnauthorized)
-			w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
-			p.writeError(w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-		p.handleChat(w, r)
-	})
 }
 
 func (p *Proxy) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -317,13 +305,18 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	primaryStart := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
 	if err != nil {
-		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
+		if clientGone(r, err) {
+			log.Info("client aborted request", "upstream", p.cfg.Upstreams.Primary.Name)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, "", statusClientClosedRequest)
+			return
+		}
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("primary api key unavailable", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
 			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "primary upstream api key unavailable")
 			return
 		}
+		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 		if !p.cfg.FallbackOnConnErr() {
 			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
 			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
@@ -335,13 +328,11 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonConnectionError)
 		return
 	}
-	p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Debug("served by primary", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
-		p.stats.ObserveRequest(stats.UpstreamPrimary, stats.Success, "", resp.StatusCode)
-		p.stream(w, resp)
+		p.finishStream(w, r, resp, primaryStart, stats.UpstreamPrimary, "", log)
 		return
 	}
 
@@ -352,36 +343,70 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 			"status", resp.StatusCode,
 			"fallback", p.cfg.Upstreams.Fallback.Name)
 		log.Debug("primary quota response detail", "detail", safeDetail(errBody))
+		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonQuota)
 		return
 	}
 
 	log.Warn("primary error; passing through", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+	p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
+	if clientGone(r, nil) {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, "", statusClientClosedRequest)
+		return
+	}
 	p.stats.ObserveRequest(stats.UpstreamPrimary, stats.UpstreamErr, "", resp.StatusCode)
 	writeUpstream(w, resp, errBody)
+}
+
+// finishStream streams resp to the client, then records the attempt latency and
+// the final outcome. Latency is recorded after the body has been copied, so a
+// long SSE response is timed to completion rather than to first byte. The
+// outcome is ClientAbort if the client disconnected mid-stream, UpstreamErr if
+// the upstream body failed, and Success only when the body completed.
+func (p *Proxy) finishStream(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, upstream, reason string, log *slog.Logger) {
+	err := p.stream(w, resp)
+	p.stats.ObserveLatency(upstream, time.Since(start))
+
+	status := resp.StatusCode
+	ok := status >= 200 && status < 300
+	switch {
+	case err == nil && ok:
+		p.stats.ObserveRequest(upstream, stats.Success, reason, status)
+	case err != nil && clientGone(r, err):
+		log.Info("client aborted while streaming", "upstream", upstream)
+		p.stats.ObserveRequest(upstream, stats.ClientAbort, reason, status)
+	default:
+		if err != nil {
+			log.Error("upstream stream failed", "upstream", upstream, "err", err)
+		}
+		p.stats.ObserveRequest(upstream, stats.UpstreamErr, reason, status)
+	}
 }
 
 func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
 	start := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
 	if err != nil {
-		p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
+		if clientGone(r, err) {
+			log.Info("client aborted request", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientAbort, reason, statusClientClosedRequest)
+			return
+		}
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("fallback api key unavailable", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
 			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "fallback upstream api key unavailable")
 			return
 		}
+		p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
 		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
 		p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
 		return
 	}
-	p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
 	log.Info("served by fallback", "upstream", p.cfg.Upstreams.Fallback.Name, "status", resp.StatusCode, "reason", reason)
-	p.stats.ObserveRequest(stats.UpstreamFallback, outcomeForStatus(resp.StatusCode), reason, resp.StatusCode)
 	defer func() { _ = resp.Body.Close() }()
-	p.stream(w, resp)
+	p.finishStream(w, r, resp, start, stats.UpstreamFallback, reason, log)
 }
 
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
@@ -407,7 +432,7 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
-	p.stream(w, resp)
+	_ = p.stream(w, resp)
 }
 
 // encodePrimary clones the payload for the primary upstream, dropping
@@ -448,7 +473,10 @@ func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte
 	return p.client.Do(req)
 }
 
-func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) {
+// stream copies the upstream response body to the client. It returns nil only
+// when the body was fully consumed; a read error (upstream) or write error
+// (client) is returned.
+func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) error {
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 
@@ -458,14 +486,17 @@ func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
+				return werr
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
 		}
 		if err != nil {
-			return
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
 		}
 	}
 }
@@ -489,12 +520,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
-// outcomeForStatus classifies a final upstream/served status code.
-func outcomeForStatus(status int) stats.Outcome {
-	if status >= 200 && status < 300 {
-		return stats.Success
+// statusClientClosedRequest is the non-standard 499 status used to classify a
+// request abandoned by the client.
+const statusClientClosedRequest = 499
+
+// clientGone reports whether err (or the request context) indicates the client
+// disconnected, as opposed to an upstream failure. The server cancels the
+// request context when the client hangs up; an upstream timeout, by contrast,
+// leaves the context live and must not be treated as a client abort. err may be
+// nil, in which case only the context is consulted.
+func clientGone(r *http.Request, err error) bool {
+	if r.Context().Err() == nil {
+		return false
 	}
-	return stats.UpstreamErr
+	return err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (p *Proxy) instrument(next http.Handler) http.Handler {
@@ -531,8 +570,17 @@ func (p *Proxy) instrument(next http.Handler) http.Handler {
 }
 
 func (p *Proxy) authenticate(next http.Handler) http.Handler {
+	return p.authenticateWith(next, nil)
+}
+
+// authenticateWith wraps next with authentication. If onReject is non-nil it is
+// called before the 401 is written (used to record unauthorized attempts).
+func (p *Proxy) authenticateWith(next http.Handler, onReject func()) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !p.authorized(r) {
+			if onReject != nil {
+				onReject()
+			}
 			w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
 			p.writeError(w, http.StatusUnauthorized, "unauthorized")
 			return

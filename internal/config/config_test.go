@@ -1,6 +1,7 @@
 package config
 
 import (
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -189,6 +190,8 @@ func TestValidateErrors(t *testing.T) {
 		{"zero dial timeout", func(c *Config) { c.Server.DialTimeout = 0 }, "server.dial_timeout"},
 		{"zero shutdown timeout", func(c *Config) { c.Server.ShutdownTimeout = 0 }, "server.shutdown_timeout"},
 		{"bad stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, 0} }, "stats.buckets[1]"},
+		{"duplicate stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, 1} }, "duplicate bucket"},
+		{"infinite stats bucket", func(c *Config) { c.Stats.Buckets = []float64{1, math.Inf(1)} }, "stats.buckets[1]"},
 	}
 
 	for _, tt := range tests {
