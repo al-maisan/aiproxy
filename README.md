@@ -136,8 +136,8 @@ in-process and reset on restart.
   are never logged. The client's `Authorization` header is never forwarded
   upstream; a request whose upstream key cannot be resolved fails instead.
 - Client token comparison is constant-time; ambient credentials (`Cookie`,
-  `X-Forwarded-*`), hop-by-hop headers and headers named in `Connection` are
-  stripped in both directions.
+  `X-Amz-Security-Token`, `X-Forwarded-*`), hop-by-hop headers and headers named
+  in `Connection` are stripped in both directions.
 - Request bodies are size-limited (and read within `body_read_timeout`) and
   upstream calls are bounded by timeouts.
 - TLS certificates are always verified. The generated config is written `0600`,

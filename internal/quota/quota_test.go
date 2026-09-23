@@ -89,3 +89,45 @@ func TestNewRejectsInvalidPattern(t *testing.T) {
 		t.Fatal("expected error for invalid pattern")
 	}
 }
+
+// FuzzPatternMatch exercises Match with arbitrary status codes and bodies
+// against a representative pattern set (mirroring the configured defaults).
+// Match must not panic and must stay total: any (status, body) pair either
+// classifies or not, without assuming a body shape.
+func FuzzPatternMatch(f *testing.F) {
+	d, err := New(nil, []string{
+		`(?i)\bquota\b`,
+		`(?i)usage limit`,
+		`(?i)usage-limit`,
+		`(?i)insufficient[_ ]?quota`,
+		`(?i)insufficient (funds|credits|balance)`,
+		`(?i)credit balance`,
+		`(?i)out of credits`,
+		`(?i)no (more )?credits`,
+		`(?i)monthly limit`,
+	})
+	if err != nil {
+		f.Fatalf("New: %v", err)
+	}
+	for _, seed := range []struct {
+		status int
+		body   string
+	}{
+		{402, `{"error":"no"}`},
+		{429, `{"error":"slow down"}`},
+		{400, `{"error":"Quota exceeded"}`},
+		{403, "Usage Limit reached"},
+		{400, `{"error":"bad request"}`},
+		{200, ""},
+		{500, "internal error"},
+		{0, ""},
+		{-1, "\x00\xff quota"},
+		{999, "insufficient_quota"},
+		{429, "no more credits; monthly usage-limit reached"},
+	} {
+		f.Add(seed.status, seed.body)
+	}
+	f.Fuzz(func(_ *testing.T, status int, body string) {
+		d.Match(status, []byte(body))
+	})
+}

@@ -43,16 +43,18 @@ var hopByHopHeaders = map[string]struct{}{
 }
 
 // requestHeaderDenylist drops ambient client credentials and forwarding
-// headers before a request reaches an upstream.
+// headers before a request reaches an upstream. The upstream's own key is set
+// fresh in forward, so stripping these can never lock the proxy out.
 var requestHeaderDenylist = map[string]struct{}{
-	"cookie":            {},
-	"cookie2":           {},
-	"set-cookie":        {},
-	"forwarded":         {},
-	"x-forwarded-for":   {},
-	"x-forwarded-host":  {},
-	"x-forwarded-proto": {},
-	"x-real-ip":         {},
+	"cookie":               {},
+	"cookie2":              {},
+	"set-cookie":           {},
+	"forwarded":            {},
+	"x-amz-security-token": {},
+	"x-forwarded-for":      {},
+	"x-forwarded-host":     {},
+	"x-forwarded-proto":    {},
+	"x-real-ip":            {},
 }
 
 // responseHeaderDenylist drops upstream headers that must not reach the client.
