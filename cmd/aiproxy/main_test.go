@@ -265,14 +265,54 @@ func TestResolveConfigPathNotFound(t *testing.T) {
 	if _, err := os.Stat("/etc/aiproxy/config.toml"); err == nil {
 		t.Skip("/etc/aiproxy/config.toml exists on this host")
 	}
-	if _, err := os.Stat("aiproxy.toml"); err == nil {
-		t.Skip("aiproxy.toml exists in the working directory")
-	}
 	t.Setenv("AIPROXY_CONFIG", "")
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	t.Setenv("HOME", t.TempDir())
 	if _, err := resolveConfigPath(""); err == nil {
 		t.Fatal("expected error when no config file exists")
+	}
+}
+
+func TestResolveConfigPathIgnoresCWD(t *testing.T) {
+	if _, err := os.Stat("/etc/aiproxy/config.toml"); err == nil {
+		t.Skip("/etc/aiproxy/config.toml exists on this host")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "aiproxy.toml"), []byte("listen = \"127.0.0.1:1\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	t.Setenv("AIPROXY_CONFIG", "")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	if got, err := resolveConfigPath(""); err == nil {
+		t.Fatalf("resolveConfigPath = %q, want error (CWD config must be ignored)", got)
+	}
+}
+
+func TestIsLoopbackListen(t *testing.T) {
+	tests := map[string]bool{
+		"127.0.0.1:8787": true,
+		"127.0.0.1:0":    true,
+		"[::1]:8787":     true,
+		"localhost:8787": false,
+		"0.0.0.0:8787":   false,
+		":8787":          false,
+		"192.168.1.5:80": false,
+		"bad":            false,
+	}
+	for addr, want := range tests {
+		if got := isLoopbackListen(addr); got != want {
+			t.Errorf("isLoopbackListen(%q) = %v, want %v", addr, got, want)
+		}
 	}
 }
 

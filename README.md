@@ -88,9 +88,9 @@ Top-level keys:
 
 `[log]` — `level` (`debug\|info\|warn\|error`), `format` (`text\|json`).
 
-`[server]` — `read_header_timeout`, `upstream_header_timeout`, `dial_timeout`,
-`idle_conn_timeout`, `shutdown_timeout`, `max_body_bytes`,
-`fallback_on_connection_error`.
+`[server]` — `read_header_timeout`, `body_read_timeout`,
+`upstream_header_timeout`, `dial_timeout`, `idle_conn_timeout`,
+`shutdown_timeout`, `max_body_bytes`, `fallback_on_connection_error`.
 
 `[upstreams.primary]` / `[upstreams.fallback]` — `name`, `chat_url`,
 `models_url`, `api_key`. Key sources: `literal:<v>`, `env:<VAR>`, `file:<path>`,
@@ -106,13 +106,19 @@ the primary), optional `fallback` (model id at the fallback; defaults to
 ## Security
 
 - Binds to loopback by default. Set `client_token` before exposing it; readiness
-  and proxied routes then require the token (liveness stays open).
+  and proxied routes then require the token (liveness stays open). Binding a
+  non-loopback address without `client_token` logs a warning.
 - API keys are resolved from environment, files, or the OpenCode auth store and
-  are never logged.
+  are never logged. The client's `Authorization` header is never forwarded
+  upstream; a request whose upstream key cannot be resolved fails instead.
 - Client token comparison is constant-time; ambient credentials (`Cookie`,
-  `X-Forwarded-*`) and hop-by-hop headers are stripped in both directions.
-- Request bodies are size-limited and upstream calls are bounded by timeouts.
-- TLS certificates are always verified. The generated config is written `0600`.
+  `X-Forwarded-*`), hop-by-hop headers and headers named in `Connection` are
+  stripped in both directions.
+- Request bodies are size-limited (and read within `body_read_timeout`) and
+  upstream calls are bounded by timeouts.
+- TLS certificates are always verified. The generated config is written `0600`,
+  and the config is only loaded from explicit, XDG, home or `/etc` locations —
+  never the working directory.
 
 ## Development
 

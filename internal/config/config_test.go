@@ -182,6 +182,7 @@ func TestValidateErrors(t *testing.T) {
 		{"bad quota pattern", func(c *Config) { c.Quota.Patterns = []string{"("} }, "quota.patterns[0]"},
 		{"zero body bytes", func(c *Config) { c.Server.MaxBodyBytes = 0 }, "server.max_body_bytes"},
 		{"zero read header timeout", func(c *Config) { c.Server.ReadHeaderTimeout = 0 }, "server.read_header_timeout"},
+		{"zero body read timeout", func(c *Config) { c.Server.BodyReadTimeout = 0 }, "server.body_read_timeout"},
 		{"zero upstream header timeout", func(c *Config) { c.Server.UpstreamHeaderTimeout = 0 }, "server.upstream_header_timeout"},
 		{"zero dial timeout", func(c *Config) { c.Server.DialTimeout = 0 }, "server.dial_timeout"},
 		{"zero shutdown timeout", func(c *Config) { c.Server.ShutdownTimeout = 0 }, "server.shutdown_timeout"},
@@ -247,6 +248,17 @@ func TestLoadSurfacesValidationErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("error = %v, want mention of listen", err)
+	}
+}
+
+func TestValidateTrimsClientToken(t *testing.T) {
+	cfg := Default()
+	cfg.ClientToken = "  sekret  "
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if cfg.ClientToken != "sekret" {
+		t.Fatalf("ClientToken = %q, want trimmed %q", cfg.ClientToken, "sekret")
 	}
 }
 

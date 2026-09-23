@@ -528,6 +528,54 @@ func TestCloneWithModel(t *testing.T) {
 	}
 }
 
+func TestPrimaryBodyPreservesLargeIntegers(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "{}")
+	})
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be called")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	srv := newProxy(t, cfg)
+
+	// 9007199254740993 is not representable as float64; it must not be rounded.
+	resp, _ := post(t, srv.URL+"/v1/chat/completions",
+		`{"model":"req-model","seed":9007199254740993}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := string(primary.call(0).body); !strings.Contains(got, "9007199254740993") {
+		t.Fatalf("primary body = %s, want exact seed 9007199254740993", got)
+	}
+}
+
+func TestTrailingJSONRejected(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	srv := newProxy(t, cfg)
+
+	resp, _ := post(t, srv.URL+"/v1/chat/completions",
+		`{"model":"req-model"}{"model":"smuggled"}`, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestReadyzHidesKeySourceDetail(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	secretPath := "/nonexistent/secret/location/aiproxy.key"
+	cfg.Upstreams.Primary.APIKey = "file:" + secretPath
+	cfg.ClientToken = "t"
+	srv := newProxy(t, cfg)
+
+	resp, body := getWith(t, srv.URL+"/readyz", map[string]string{"Authorization": "Bearer t"})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if strings.Contains(body, secretPath) {
+		t.Fatalf("readyz body leaked key path: %s", body)
+	}
+}
+
 func TestBearerToken(t *testing.T) {
 	tests := map[string]string{
 		"Bearer abc":  "abc",
@@ -589,12 +637,12 @@ func TestPrimaryKeyUnresolvedFallsBack(t *testing.T) {
 	}
 }
 
-func TestPrimaryKeyUsesClientAuthorization(t *testing.T) {
+func TestPrimaryKeyUnresolvedDoesNotForwardClientAuthorization(t *testing.T) {
 	primary := newFake(t, func(w http.ResponseWriter, _ int) {
 		_, _ = io.WriteString(w, "primary-served")
 	})
-	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
-		t.Error("fallback must not be called")
+	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "fallback-served")
 	})
 	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
 	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
@@ -602,11 +650,14 @@ func TestPrimaryKeyUsesClientAuthorization(t *testing.T) {
 
 	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`,
 		map[string]string{"Authorization": "Bearer client-token"})
-	if resp.StatusCode != http.StatusOK || body != "primary-served" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusOK || body != "fallback-served" {
+		t.Fatalf("status=%d body=%q, want fallback-served", resp.StatusCode, body)
 	}
-	if got := primary.call(0).header.Get("Authorization"); got != "Bearer client-token" {
-		t.Fatalf("primary authorization = %q, want client token", got)
+	if primary.count() != 0 {
+		t.Fatalf("primary calls = %d, want 0", primary.count())
+	}
+	if got := fallback.call(0).header.Get("Authorization"); got != "Bearer fallback-key" {
+		t.Fatalf("fallback authorization = %q, want its own key, client token must not be forwarded", got)
 	}
 }
 
@@ -627,7 +678,7 @@ func TestFallbackKeyUnresolvedReturnsBadGateway(t *testing.T) {
 	}
 }
 
-func TestModelsUsesClientAuthorization(t *testing.T) {
+func TestModelsUnresolvedKeyDoesNotForwardClientAuthorization(t *testing.T) {
 	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
 		_, _ = io.WriteString(w, `{"object":"list"}`)
 	})
@@ -636,11 +687,11 @@ func TestModelsUsesClientAuthorization(t *testing.T) {
 	srv := newProxy(t, cfg)
 
 	resp, _ := getWith(t, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer client-token"})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
-	if got := fallback.call(0).header.Get("Authorization"); got != "Bearer client-token" {
-		t.Fatalf("models authorization = %q", got)
+	if fallback.count() != 0 {
+		t.Fatalf("fallback calls = %d, want 0", fallback.count())
 	}
 }
 
@@ -745,6 +796,40 @@ func TestCopyRequestHeadersFilters(t *testing.T) {
 	}
 	if dst.Get("X-Keep") != "1" {
 		t.Errorf("X-Keep = %q, want preserved", dst.Get("X-Keep"))
+	}
+}
+
+func TestCopyRequestHeadersDropsConnectionNamed(t *testing.T) {
+	src := http.Header{}
+	src.Set("Connection", "X-Credential, keep-alive")
+	src.Set("X-Credential", "secret")
+	src.Set("X-Keep", "1")
+
+	dst := http.Header{}
+	copyRequestHeaders(dst, src)
+
+	if got := dst.Get("X-Credential"); got != "" {
+		t.Errorf("X-Credential = %q, want dropped (named in Connection)", got)
+	}
+	if dst.Get("X-Keep") != "1" {
+		t.Errorf("X-Keep = %q, want preserved", dst.Get("X-Keep"))
+	}
+}
+
+func TestCopyResponseHeadersDropsConnectionNamed(t *testing.T) {
+	src := http.Header{}
+	src.Set("Connection", "X-Internal")
+	src.Set("X-Internal", "1")
+	src.Set("Content-Type", "application/json")
+
+	dst := http.Header{}
+	copyResponseHeaders(dst, src)
+
+	if got := dst.Get("X-Internal"); got != "" {
+		t.Errorf("X-Internal = %q, want dropped (named in Connection)", got)
+	}
+	if dst.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want preserved", dst.Get("Content-Type"))
 	}
 }
 

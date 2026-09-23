@@ -91,7 +91,11 @@ func (r *Resolver) Resolve(spec string) (string, error) {
 		return r.fromAuthFile(provider)
 
 	case strings.HasPrefix(spec, prefixLiteral):
-		return strings.TrimPrefix(spec, prefixLiteral), nil
+		value := strings.TrimPrefix(spec, prefixLiteral)
+		if value == "" {
+			return "", errors.New("literal: missing value")
+		}
+		return value, nil
 
 	default:
 		return spec, nil

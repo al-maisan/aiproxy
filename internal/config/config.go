@@ -50,6 +50,7 @@ type Log struct {
 // Server configures timeouts and limits.
 type Server struct {
 	ReadHeaderTimeout         Duration `toml:"read_header_timeout"`
+	BodyReadTimeout           Duration `toml:"body_read_timeout"`
 	UpstreamHeaderTimeout     Duration `toml:"upstream_header_timeout"`
 	DialTimeout               Duration `toml:"dial_timeout"`
 	IdleConnTimeout           Duration `toml:"idle_conn_timeout"`
@@ -135,6 +136,7 @@ func Default() *Config {
 		Log:    Log{Level: "info", Format: "text"},
 		Server: Server{
 			ReadHeaderTimeout:         Duration(15 * time.Second),
+			BodyReadTimeout:           Duration(60 * time.Second),
 			UpstreamHeaderTimeout:     Duration(180 * time.Second),
 			DialTimeout:               Duration(10 * time.Second),
 			IdleConnTimeout:           Duration(90 * time.Second),
@@ -213,6 +215,9 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Listen) == "" {
 		errs = append(errs, errors.New("listen: must not be empty"))
 	}
+	// Normalise so a token with incidental surrounding whitespace still matches
+	// the presented value, which bearerToken already trims.
+	c.ClientToken = strings.TrimSpace(c.ClientToken)
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
@@ -252,6 +257,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Server.ReadHeaderTimeout.Std() <= 0 {
 		errs = append(errs, errors.New("server.read_header_timeout: must be greater than zero"))
+	}
+	if c.Server.BodyReadTimeout.Std() <= 0 {
+		errs = append(errs, errors.New("server.body_read_timeout: must be greater than zero"))
 	}
 	if c.Server.UpstreamHeaderTimeout.Std() <= 0 {
 		errs = append(errs, errors.New("server.upstream_header_timeout: must be greater than zero"))

@@ -20,10 +20,14 @@ expect an acknowledgement and a coordinated disclosure timeline.
 - It binds to `127.0.0.1` by default. Only expose it on a wider interface after
   setting `client_token`.
 - API keys are read from the environment, files, or the OpenCode auth store and
-  are never written to logs.
+  are never written to logs. The client's `Authorization` header is never
+  forwarded upstream; unresolved upstream keys cause the request to fail.
 - Upstream TLS certificates are always verified.
-- Request bodies are size-limited, upstream calls are bounded by timeouts, and
-  ambient/forwarding headers are stripped in both directions.
+- Request bodies are size-limited and read within a bounded timeout, upstream
+  calls are bounded by timeouts, and ambient/forwarding headers, hop-by-hop
+  headers and headers named in `Connection` are stripped in both directions.
+- Configuration is loaded only from explicit, XDG, home or `/etc` locations,
+  never from the working directory.
 
 Operators are responsible for the secrecy and permissions of any key files and
 for the network placement of the service.
