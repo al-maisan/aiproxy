@@ -1,0 +1,526 @@
+// Package proxy implements the request routing and quota-based failover logic.
+package proxy
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/al-maisan/aiproxy/internal/config"
+	"github.com/al-maisan/aiproxy/internal/keys"
+	"github.com/al-maisan/aiproxy/internal/quota"
+)
+
+type ctxKey int
+
+const ctxKeyRequestID ctxKey = iota
+
+// hopByHopHeaders are removed in both directions per RFC 7230.
+var hopByHopHeaders = map[string]struct{}{
+	"connection":          {},
+	"keep-alive":          {},
+	"proxy-authenticate":  {},
+	"proxy-authorization": {},
+	"te":                  {},
+	"trailer":             {},
+	"transfer-encoding":   {},
+	"upgrade":             {},
+}
+
+// requestHeaderDenylist drops ambient client credentials and forwarding
+// headers before a request reaches an upstream.
+var requestHeaderDenylist = map[string]struct{}{
+	"cookie":            {},
+	"cookie2":           {},
+	"set-cookie":        {},
+	"forwarded":         {},
+	"x-forwarded-for":   {},
+	"x-forwarded-host":  {},
+	"x-forwarded-proto": {},
+	"x-real-ip":         {},
+}
+
+// responseHeaderDenylist drops upstream headers that must not reach the client.
+var responseHeaderDenylist = map[string]struct{}{
+	"set-cookie": {},
+}
+
+// Proxy is an http.Handler that prefers the primary upstream for routed models
+// and transparently falls back to the fallback upstream on quota exhaustion.
+type Proxy struct {
+	cfg    *config.Config
+	log    *slog.Logger
+	keys   *keys.Resolver
+	quota  *quota.Detector
+	client *http.Client
+	routes map[string]config.Route
+	strip  map[string]struct{}
+}
+
+// New constructs a Proxy from config. It does not perform any I/O.
+func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error) {
+	q, err := quota.New(cfg.Quota.Statuses, cfg.Quota.Patterns)
+	if err != nil {
+		return nil, err
+	}
+	transport := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: cfg.Server.DialTimeout.Std(), KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       cfg.Server.IdleConnTimeout.Std(),
+		ResponseHeaderTimeout: cfg.Server.UpstreamHeaderTimeout.Std(),
+		ExpectContinueTimeout: time.Second,
+	}
+
+	routes := make(map[string]config.Route, len(cfg.Routes))
+	for _, r := range cfg.Routes {
+		routes[r.Requested] = r
+	}
+	strip := make(map[string]struct{}, len(cfg.StripFields))
+	for _, f := range cfg.StripFields {
+		strip[f] = struct{}{}
+	}
+
+	return &Proxy{
+		cfg:    cfg,
+		log:    log,
+		keys:   kr,
+		quota:  q,
+		client: &http.Client{Transport: transport},
+		routes: routes,
+		strip:  strip,
+	}, nil
+}
+
+// Handler returns the root HTTP handler.
+func (p *Proxy) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", p.handleHealth)
+	mux.Handle("GET /readyz", p.instrument(p.authenticate(http.HandlerFunc(p.handleReady))))
+	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
+		mux.Handle("POST "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleChat))))
+	}
+	for _, path := range []string{"/v1/models", "/models"} {
+		mux.Handle("GET "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleModels))))
+	}
+	return mux
+}
+
+func (p *Proxy) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, "ok\n")
+}
+
+func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
+	type check struct {
+		Upstream string `json:"upstream"`
+		OK       bool   `json:"ok"`
+		Error    string `json:"error,omitempty"`
+	}
+	checks := make([]check, 0, 2)
+	ready := true
+	for _, up := range []config.Upstream{p.cfg.Upstreams.Primary, p.cfg.Upstreams.Fallback} {
+		c := check{Upstream: up.Name, OK: true}
+		if _, err := p.keys.Resolve(up.APIKey); err != nil {
+			c.OK = false
+			c.Error = err.Error()
+			ready = false
+		}
+		checks = append(checks, c)
+	}
+	status := http.StatusOK
+	if !ready {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, map[string]any{"ready": ready, "checks": checks})
+}
+
+func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, p.cfg.Server.MaxBodyBytes+1))
+	_ = r.Body.Close()
+	if err != nil {
+		p.writeError(w, http.StatusBadRequest, "failed to read request body")
+		return
+	}
+	if int64(len(body)) > p.cfg.Server.MaxBodyBytes {
+		p.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		p.writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return
+	}
+	model, _ := payload["model"].(string)
+	if strings.TrimSpace(model) == "" {
+		p.writeError(w, http.StatusBadRequest, "missing model")
+		return
+	}
+
+	log := p.log.With("request_id", requestID(r.Context()), "model", model)
+
+	route, routed := p.routes[model]
+	if !routed {
+		log.Debug("no route for model; using fallback", "upstream", p.cfg.Upstreams.Fallback.Name)
+		p.forwardFallback(w, r, body, log, "unrouted")
+		return
+	}
+
+	// The fallback normally receives the client body verbatim (clients speak the
+	// fallback's model ids); only rewrite it when the route maps a different id.
+	fallbackBody := body
+	if route.FallbackModel() != model {
+		fallbackBody, err = cloneWithModel(payload, route.FallbackModel(), nil)
+		if err != nil {
+			log.Error("failed to encode fallback request", "err", err)
+			p.writeError(w, http.StatusInternalServerError, "failed to encode request")
+			return
+		}
+	}
+
+	primaryBody, err := p.encodePrimary(payload, route.Primary)
+	if err != nil {
+		log.Error("failed to encode primary request", "err", err)
+		p.writeError(w, http.StatusInternalServerError, "failed to encode request")
+		return
+	}
+
+	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
+	if err != nil {
+		if !p.cfg.FallbackOnConnErr() {
+			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.writeError(w, http.StatusBadGateway, "primary upstream request failed")
+			return
+		}
+		log.Warn("primary unreachable; falling back",
+			"upstream", p.cfg.Upstreams.Primary.Name, "fallback", p.cfg.Upstreams.Fallback.Name, "err", err)
+		p.forwardFallback(w, r, fallbackBody, log, "connection_error")
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		log.Debug("served by primary", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+		p.stream(w, resp)
+		return
+	}
+
+	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if p.quota.IsQuota(resp.StatusCode, errBody) {
+		log.Warn("primary quota reached; falling back",
+			"upstream", p.cfg.Upstreams.Primary.Name,
+			"status", resp.StatusCode,
+			"fallback", p.cfg.Upstreams.Fallback.Name)
+		log.Debug("primary quota response detail", "detail", safeDetail(errBody))
+		p.forwardFallback(w, r, fallbackBody, log, "quota")
+		return
+	}
+
+	log.Warn("primary error; passing through", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+	writeUpstream(w, resp, errBody)
+}
+
+func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
+	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
+	if err != nil {
+		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
+		return
+	}
+	log.Info("served by fallback", "upstream", p.cfg.Upstreams.Fallback.Name, "status", resp.StatusCode, "reason", reason)
+	defer func() { _ = resp.Body.Close() }()
+	p.stream(w, resp)
+}
+
+func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
+	up := p.cfg.Upstreams.Fallback
+	if strings.TrimSpace(up.ModelsURL) == "" {
+		p.writeError(w, http.StatusNotFound, "models endpoint not configured")
+		return
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, up.ModelsURL, http.NoBody)
+	if err != nil {
+		p.writeError(w, http.StatusInternalServerError, "failed to build models request")
+		return
+	}
+	if key, err := p.keys.Resolve(up.APIKey); err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+	} else if ah := r.Header.Get("Authorization"); ah != "" {
+		req.Header.Set("Authorization", ah)
+	} else {
+		p.writeError(w, http.StatusBadGateway, "no API key for models upstream")
+		return
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		p.writeError(w, http.StatusBadGateway, "models upstream request failed")
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	p.stream(w, resp)
+}
+
+// encodePrimary clones the payload for the primary upstream, dropping
+// fallback-only fields and swapping in the primary model id.
+func (p *Proxy) encodePrimary(payload map[string]any, model string) ([]byte, error) {
+	return cloneWithModel(payload, model, p.strip)
+}
+
+// cloneWithModel returns a copy of payload with the model id set and any keys
+// in strip removed.
+func cloneWithModel(payload map[string]any, model string, strip map[string]struct{}) ([]byte, error) {
+	out := make(map[string]any, len(payload))
+	for k, v := range payload {
+		if _, drop := strip[k]; drop {
+			continue
+		}
+		out[k] = v
+	}
+	out["model"] = model
+	return json.Marshal(out)
+}
+
+func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(clientReq.Context(), http.MethodPost, up.ChatURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	copyRequestHeaders(req.Header, clientReq.Header)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream, application/json")
+
+	if key, err := p.keys.Resolve(up.APIKey); err == nil {
+		req.Header.Set("Authorization", "Bearer "+key)
+	} else if ah := clientReq.Header.Get("Authorization"); ah != "" {
+		req.Header.Set("Authorization", ah)
+	} else {
+		return nil, fmt.Errorf("resolve API key for %s: %w", up.Name, err)
+	}
+	return p.client.Do(req)
+}
+
+func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) {
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func writeUpstream(w http.ResponseWriter, resp *http.Response, body []byte) {
+	copyResponseHeaders(w.Header(), resp.Header)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func (p *Proxy) writeError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{"message": message, "type": "aiproxy_error"},
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func (p *Proxy) instrument(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		id := sanitizeRequestID(r.Header.Get("X-Request-ID"))
+		if id == "" {
+			id = newRequestID()
+		}
+		w.Header().Set("X-Request-ID", id)
+
+		rec := &recorder{ResponseWriter: w}
+		ctx := context.WithValue(r.Context(), ctxKeyRequestID, id)
+
+		defer func() {
+			if v := recover(); v != nil {
+				p.log.Error("recovered from panic", "request_id", id, "panic", fmt.Sprint(v))
+				if rec.status == 0 {
+					http.Error(rec, "internal server error", http.StatusInternalServerError)
+				}
+			}
+			p.log.Info("request",
+				"request_id", id,
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rec.statusCode(),
+				"bytes", rec.bytes,
+				"duration_ms", time.Since(start).Milliseconds(),
+			)
+		}()
+
+		next.ServeHTTP(rec, r.WithContext(ctx))
+	})
+}
+
+func (p *Proxy) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if p.cfg.ClientToken != "" {
+			// Compare fixed-size digests to avoid a length-dependent branch.
+			got := sha256.Sum256([]byte(bearerToken(r.Header.Get("Authorization"))))
+			want := sha256.Sum256([]byte(p.cfg.ClientToken))
+			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+				w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
+				p.writeError(w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+type recorder struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (r *recorder) WriteHeader(code int) {
+	if r.status == 0 {
+		r.status = code
+	}
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *recorder) Write(b []byte) (int, error) {
+	if r.status == 0 {
+		r.status = http.StatusOK
+	}
+	n, err := r.ResponseWriter.Write(b)
+	r.bytes += int64(n)
+	return n, err
+}
+
+func (r *recorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (r *recorder) statusCode() int {
+	if r.status == 0 {
+		return http.StatusOK
+	}
+	return r.status
+}
+
+func copyRequestHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		lk := strings.ToLower(k)
+		if _, hop := hopByHopHeaders[lk]; hop {
+			continue
+		}
+		if _, denied := requestHeaderDenylist[lk]; denied {
+			continue
+		}
+		switch lk {
+		case "host", "content-length", "authorization", "accept-encoding":
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func copyResponseHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		lk := strings.ToLower(k)
+		if _, hop := hopByHopHeaders[lk]; hop {
+			continue
+		}
+		if _, denied := responseHeaderDenylist[lk]; denied {
+			continue
+		}
+		if lk == "content-length" {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func requestID(ctx context.Context) string {
+	v, _ := ctx.Value(ctxKeyRequestID).(string)
+	return v
+}
+
+func bearerToken(header string) string {
+	const prefix = "Bearer "
+	if len(header) > len(prefix) && strings.EqualFold(header[:len(prefix)], prefix) {
+		return strings.TrimSpace(header[len(prefix):])
+	}
+	return ""
+}
+
+func newRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// sanitizeRequestID accepts a caller-supplied correlation id only if it is
+// short and made of a conservative character set; otherwise it returns "" so a
+// fresh id is generated.
+func sanitizeRequestID(id string) string {
+	if id == "" || len(id) > 128 {
+		return ""
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.', r == ':':
+		default:
+			return ""
+		}
+	}
+	return id
+}
+
+func safeDetail(body []byte) string {
+	s := strings.Join(strings.Fields(string(body)), " ")
+	if r := []rune(s); len(r) > 300 {
+		s = string(r[:300]) + "..."
+	}
+	return s
+}

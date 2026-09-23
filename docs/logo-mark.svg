@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="title desc">
+  <title id="title">aiproxy mark</title>
+  <desc id="desc">A request forks into a solid primary path and a dashed fallback path.</desc>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <!-- fallback (dashed) -->
+    <path d="M32 64 C 58 64 58 94 84 94" stroke="#F59E0B" stroke-width="8" stroke-dasharray="14 12"/>
+    <circle cx="100" cy="94" r="10" stroke="#F59E0B" stroke-width="7"/>
+    <!-- primary (solid) -->
+    <path d="M32 64 C 58 64 58 34 84 34" stroke="#4F46E5" stroke-width="8"/>
+    <circle cx="100" cy="34" r="10" fill="#4F46E5" stroke="none"/>
+    <!-- input node -->
+    <circle cx="22" cy="64" r="10" fill="#4F46E5" stroke="none"/>
+  </g>
+</svg>

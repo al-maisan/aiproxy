@@ -1,0 +1,31 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - prealloc
+    - revive
+    - unconvert
+    - whitespace
+  settings:
+    gocritic:
+      enabled-tags:
+        - performance
+        - style
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - gosec
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
