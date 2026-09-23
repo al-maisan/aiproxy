@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- `X-Amz-Security-Token` (an ambient AWS session credential) is now stripped
+  from forwarded requests, alongside the other ambient credentials; a client
+  operating behind AWS SIGV4 would otherwise have its session token forwarded
+  to the upstream provider.
+
 ### Fixed
 
 - Quota fallbacks now log which configured rule matched (the status code or the

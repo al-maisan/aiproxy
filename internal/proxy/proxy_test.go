@@ -1019,6 +1019,7 @@ func TestCopyRequestHeadersFilters(t *testing.T) {
 	src.Set("Cookie", "session=1")
 	src.Set("X-Forwarded-For", "10.0.0.1")
 	src.Set("X-Real-IP", "10.0.0.1")
+	src.Set("X-Amz-Security-Token", "session-token")
 	src.Set("X-Keep", "1")
 
 	dst := http.Header{}
@@ -1026,7 +1027,7 @@ func TestCopyRequestHeadersFilters(t *testing.T) {
 
 	for _, dropped := range []string{
 		"Authorization", "Connection", "Host", "Content-Length", "Accept-Encoding",
-		"Cookie", "X-Forwarded-For", "X-Real-IP",
+		"Cookie", "X-Forwarded-For", "X-Real-IP", "X-Amz-Security-Token",
 	} {
 		if got := dst.Get(dropped); got != "" {
 			t.Errorf("%s = %q, want dropped", dropped, got)
