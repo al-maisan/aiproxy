@@ -50,6 +50,7 @@ type Log struct {
 // Server configures timeouts and limits.
 type Server struct {
 	ReadHeaderTimeout         Duration `toml:"read_header_timeout"`
+	BodyReadTimeout           Duration `toml:"body_read_timeout"`
 	UpstreamHeaderTimeout     Duration `toml:"upstream_header_timeout"`
 	DialTimeout               Duration `toml:"dial_timeout"`
 	IdleConnTimeout           Duration `toml:"idle_conn_timeout"`
@@ -135,6 +136,7 @@ func Default() *Config {
 		Log:    Log{Level: "info", Format: "text"},
 		Server: Server{
 			ReadHeaderTimeout:         Duration(15 * time.Second),
+			BodyReadTimeout:           Duration(60 * time.Second),
 			UpstreamHeaderTimeout:     Duration(180 * time.Second),
 			DialTimeout:               Duration(10 * time.Second),
 			IdleConnTimeout:           Duration(90 * time.Second),
@@ -200,10 +202,33 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("config %s: unknown fields: %s", path, strings.Join(keys, ", "))
 	}
+	if err := cfg.normalize(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// normalize applies canonicalisation that is not validation: currently it trims
+// surrounding whitespace from client_token so it matches the presented value
+// (bearerToken already trims).
+func (c *Config) normalize() error {
+	if err := c.checkClientToken(); err != nil {
+		return err
+	}
+	c.ClientToken = strings.TrimSpace(c.ClientToken)
+	return nil
+}
+
+// checkClientToken rejects a client_token that is present but blank. Such a
+// token would be trimmed to "" and silently disable authentication.
+func (c *Config) checkClientToken() error {
+	if c.ClientToken != "" && strings.TrimSpace(c.ClientToken) == "" {
+		return errors.New("client_token: must not be blank")
+	}
+	return nil
 }
 
 // Validate checks the configuration for errors.
@@ -212,6 +237,9 @@ func (c *Config) Validate() error {
 
 	if strings.TrimSpace(c.Listen) == "" {
 		errs = append(errs, errors.New("listen: must not be empty"))
+	}
+	if err := c.checkClientToken(); err != nil {
+		errs = append(errs, err)
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
@@ -253,6 +281,9 @@ func (c *Config) Validate() error {
 	if c.Server.ReadHeaderTimeout.Std() <= 0 {
 		errs = append(errs, errors.New("server.read_header_timeout: must be greater than zero"))
 	}
+	if c.Server.BodyReadTimeout.Std() <= 0 {
+		errs = append(errs, errors.New("server.body_read_timeout: must be greater than zero"))
+	}
 	if c.Server.UpstreamHeaderTimeout.Std() <= 0 {
 		errs = append(errs, errors.New("server.upstream_header_timeout: must be greater than zero"))
 	}
@@ -277,6 +308,8 @@ func validateUpstream(field string, u Upstream) []error {
 	}
 	if strings.TrimSpace(u.APIKey) == "" {
 		errs = append(errs, fmt.Errorf("%s.api_key: must not be empty", field))
+	} else if strings.TrimSpace(u.APIKey) == "literal:" {
+		errs = append(errs, fmt.Errorf("%s.api_key: literal: must have a value", field))
 	}
 	return errs
 }

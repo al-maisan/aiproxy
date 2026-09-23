@@ -9,12 +9,15 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/al-maisan/aiproxy/internal/config"
@@ -56,6 +59,11 @@ var responseHeaderDenylist = map[string]struct{}{
 	"set-cookie": {},
 }
 
+// errKeyUnavailable marks a failure to resolve an upstream API key. It is
+// distinct from a transport error so callers do not trigger a fallback: a
+// missing key is a configuration problem, not an unreachable upstream.
+var errKeyUnavailable = errors.New("api key unavailable")
+
 // Proxy is an http.Handler that prefers the primary upstream for routed models
 // and transparently falls back to the fallback upstream on quota exhaustion.
 type Proxy struct {
@@ -66,6 +74,12 @@ type Proxy struct {
 	client *http.Client
 	routes map[string]config.Route
 	strip  map[string]struct{}
+
+	// readyMu guards readyState, the last observed readiness per upstream.
+	// The state is tracked so /readyz can log transitions instead of logging
+	// on every poll.
+	readyMu    sync.Mutex
+	readyState map[string]bool
 }
 
 // New constructs a Proxy from config. It does not perform any I/O.
@@ -95,13 +109,14 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 	}
 
 	return &Proxy{
-		cfg:    cfg,
-		log:    log,
-		keys:   kr,
-		quota:  q,
-		client: &http.Client{Transport: transport},
-		routes: routes,
-		strip:  strip,
+		cfg:        cfg,
+		log:        log,
+		keys:       kr,
+		quota:      q,
+		client:     &http.Client{Transport: transport},
+		routes:     routes,
+		strip:      strip,
+		readyState: make(map[string]bool),
 	}, nil
 }
 
@@ -133,12 +148,23 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 	}
 	checks := make([]check, 0, 2)
 	ready := true
-	for _, up := range []config.Upstream{p.cfg.Upstreams.Primary, p.cfg.Upstreams.Fallback} {
-		c := check{Upstream: up.Name, OK: true}
-		if _, err := p.keys.Resolve(up.APIKey); err != nil {
+	for _, u := range []struct {
+		role, name string
+		up         config.Upstream
+	}{
+		{"primary", p.cfg.Upstreams.Primary.Name, p.cfg.Upstreams.Primary},
+		{"fallback", p.cfg.Upstreams.Fallback.Name, p.cfg.Upstreams.Fallback},
+	} {
+		c := check{Upstream: u.name, OK: true}
+		if _, err := p.keys.Resolve(u.up.APIKey); err != nil {
+			// Keep the diagnostic server-side: it may name local paths or
+			// environment variables that should not be disclosed to clients.
 			c.OK = false
-			c.Error = err.Error()
+			c.Error = "api key unavailable"
 			ready = false
+			p.noteReadiness(u.role, u.name, false, err)
+		} else {
+			p.noteReadiness(u.role, u.name, true, nil)
 		}
 		checks = append(checks, c)
 	}
@@ -149,10 +175,46 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, status, map[string]any{"ready": ready, "checks": checks})
 }
 
+// noteReadiness records an upstream's readiness and logs it only when the state
+// changes, so a health checker polling a misconfigured deployment does not
+// flood the logs. State is keyed by role (primary/fallback), not the
+// operator-supplied name, which the two upstreams may share.
+func (p *Proxy) noteReadiness(role, name string, ok bool, err error) {
+	p.readyMu.Lock()
+	prev, seen := p.readyState[role]
+	p.readyState[role] = ok
+	p.readyMu.Unlock()
+
+	switch {
+	case !seen && ok:
+		// First successful check: nothing to report.
+	case !seen || prev != ok:
+		if ok {
+			p.log.Info("upstream key available again", "upstream", name)
+		} else {
+			p.log.Warn("upstream key unavailable", "upstream", name, "err", err)
+		}
+	}
+}
+
 func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
+	// Bound the time a client may take to deliver the body; ReadHeaderTimeout
+	// only covers headers. Cleared afterwards so long SSE responses are
+	// unaffected.
+	if d := p.cfg.Server.BodyReadTimeout.Std(); d > 0 {
+		if err := http.NewResponseController(w).SetReadDeadline(time.Now().Add(d)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			p.log.Debug("could not set body read deadline", "err", err)
+		}
+		defer func() { _ = http.NewResponseController(w).SetReadDeadline(time.Time{}) }()
+	}
+
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.cfg.Server.MaxBodyBytes+1))
 	_ = r.Body.Close()
 	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			p.writeError(w, http.StatusRequestTimeout, "request body read timed out")
+			return
+		}
 		p.writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
@@ -162,8 +224,14 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	if err := dec.Decode(&payload); err != nil {
 		p.writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		return
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		p.writeError(w, http.StatusBadRequest, "unexpected data after JSON request body")
 		return
 	}
 	model, _ := payload["model"].(string)
@@ -202,6 +270,11 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
 	if err != nil {
+		if errors.Is(err, errKeyUnavailable) {
+			log.Error("primary api key unavailable", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.writeError(w, http.StatusBadGateway, "primary upstream api key unavailable")
+			return
+		}
 		if !p.cfg.FallbackOnConnErr() {
 			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
 			p.writeError(w, http.StatusBadGateway, "primary upstream request failed")
@@ -238,6 +311,11 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
 	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
 	if err != nil {
+		if errors.Is(err, errKeyUnavailable) {
+			log.Error("fallback api key unavailable", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+			p.writeError(w, http.StatusBadGateway, "fallback upstream api key unavailable")
+			return
+		}
 		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
 		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
 		return
@@ -258,14 +336,12 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		p.writeError(w, http.StatusInternalServerError, "failed to build models request")
 		return
 	}
-	if key, err := p.keys.Resolve(up.APIKey); err == nil {
-		req.Header.Set("Authorization", "Bearer "+key)
-	} else if ah := r.Header.Get("Authorization"); ah != "" {
-		req.Header.Set("Authorization", ah)
-	} else {
+	key, err := p.keys.Resolve(up.APIKey)
+	if err != nil {
 		p.writeError(w, http.StatusBadGateway, "no API key for models upstream")
 		return
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		p.writeError(w, http.StatusBadGateway, "models upstream request failed")
@@ -282,7 +358,8 @@ func (p *Proxy) encodePrimary(payload map[string]any, model string) ([]byte, err
 }
 
 // cloneWithModel returns a copy of payload with the model id set and any keys
-// in strip removed.
+// in strip removed. Values are re-encoded as-is; callers must have decoded the
+// payload with UseNumber so large integers keep full precision.
 func cloneWithModel(payload map[string]any, model string, strip map[string]struct{}) ([]byte, error) {
 	out := make(map[string]any, len(payload))
 	for k, v := range payload {
@@ -304,13 +381,11 @@ func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream, application/json")
 
-	if key, err := p.keys.Resolve(up.APIKey); err == nil {
-		req.Header.Set("Authorization", "Bearer "+key)
-	} else if ah := clientReq.Header.Get("Authorization"); ah != "" {
-		req.Header.Set("Authorization", ah)
-	} else {
-		return nil, fmt.Errorf("resolve API key for %s: %w", up.Name, err)
+	key, err := p.keys.Resolve(up.APIKey)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", errKeyUnavailable, up.Name, err)
 	}
+	req.Header.Set("Authorization", "Bearer "+key)
 	return p.client.Do(req)
 }
 
@@ -432,6 +507,11 @@ func (r *recorder) Flush() {
 	}
 }
 
+// Unwrap lets http.ResponseController reach the underlying ResponseWriter.
+func (r *recorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
+}
+
 func (r *recorder) statusCode() int {
 	if r.status == 0 {
 		return http.StatusOK
@@ -440,9 +520,13 @@ func (r *recorder) statusCode() int {
 }
 
 func copyRequestHeaders(dst, src http.Header) {
+	named := connectionNamedHeaders(src)
 	for k, vs := range src {
 		lk := strings.ToLower(k)
 		if _, hop := hopByHopHeaders[lk]; hop {
+			continue
+		}
+		if _, isNamed := named[lk]; isNamed {
 			continue
 		}
 		if _, denied := requestHeaderDenylist[lk]; denied {
@@ -459,9 +543,13 @@ func copyRequestHeaders(dst, src http.Header) {
 }
 
 func copyResponseHeaders(dst, src http.Header) {
+	named := connectionNamedHeaders(src)
 	for k, vs := range src {
 		lk := strings.ToLower(k)
 		if _, hop := hopByHopHeaders[lk]; hop {
+			continue
+		}
+		if _, isNamed := named[lk]; isNamed {
 			continue
 		}
 		if _, denied := responseHeaderDenylist[lk]; denied {
@@ -474,6 +562,25 @@ func copyResponseHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
+}
+
+// connectionNamedHeaders returns the lower-cased names listed in the
+// Connection header, which RFC 7230 §6.1 makes hop-by-hop. It returns nil when
+// there is no Connection header, avoiding an allocation on the common path.
+func connectionNamedHeaders(h http.Header) map[string]struct{} {
+	values := h.Values("Connection")
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]struct{})
+	for _, v := range values {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
+				out[name] = struct{}{}
+			}
+		}
+	}
+	return out
 }
 
 func requestID(ctx context.Context) string {

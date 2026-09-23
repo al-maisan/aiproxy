@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `server.body_read_timeout` bounds how long a client may take to send a request
+  body, mitigating slow-body connection hoarding.
+- A warning is logged when binding a non-loopback address without `client_token`.
+
+### Changed
+
+- **Breaking:** a request is no longer served with the client's `Authorization`
+  header when the target upstream's API key is missing. Clients that relied on
+  sending their own key with the upstream key left unset now receive `502`
+  instead. Configure the upstream key, or leave the upstream properly keyed.
+- A missing or unresolvable upstream API key no longer falls back to the other
+  upstream from the primary path; it fails with `502`. A missing primary key
+  therefore no longer silently bills every request to the fallback.
+- Request-body read deadlines now return `408` instead of `400`.
+
+### Security
+
+- The client's `Authorization` header is no longer forwarded to an upstream when
+  that upstream's API key cannot be resolved; requests fail instead of leaking
+  the proxy auth token (or a client's provider key) to a third party.
+- The config file is no longer discovered in the current working directory,
+  preventing planted-config credential and prompt exfiltration.
+- `/readyz` no longer discloses key-source paths or environment variable names.
+- Headers named in the `Connection` header are now treated as hop-by-hop
+  (RFC 7230 §6.1) in both directions.
+- Empty `literal:` key sources and blank `client_token` values are rejected when
+  the configuration is loaded.
+- Requests re-encoded for the primary now preserve large integer precision.
+
 ## [0.1.0] - 2026-09-23
 
 ### Added

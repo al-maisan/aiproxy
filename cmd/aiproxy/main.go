@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,6 +84,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	logger := newLogger(cfg.Log)
 	logger.Info("configuration loaded", "path", path, "version", version.Version)
+	if !isLoopbackListen(cfg.Listen) && cfg.ClientToken == "" {
+		logger.Warn("listening on a non-loopback address without client_token; " +
+			"set client_token to require authentication")
+	}
 
 	p, err := proxy.New(cfg, logger, keys.NewResolver(keys.DefaultAuthPath(), keyCacheTTL))
 	if err != nil {
@@ -163,7 +168,7 @@ func resolveConfigPath(explicit string) (string, error) {
 	if home, err := os.UserHomeDir(); err == nil {
 		candidates = append(candidates, filepath.Join(home, ".config", "aiproxy", "config.toml"))
 	}
-	candidates = append(candidates, "/etc/aiproxy/config.toml", "aiproxy.toml")
+	candidates = append(candidates, "/etc/aiproxy/config.toml")
 
 	for _, candidate := range candidates {
 		if _, err := os.Stat(candidate); err == nil { //nolint:gosec // operator-supplied path
@@ -182,6 +187,23 @@ func defaultUserConfigPath() string {
 		return "aiproxy.toml"
 	}
 	return filepath.Join(home, ".config", "aiproxy", "config.toml")
+}
+
+// isLoopbackListen reports whether addr binds only to the loopback interface.
+// "localhost" is accepted as loopback by convention.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func writeDefaultConfig(path string, force bool, stdout io.Writer) error {

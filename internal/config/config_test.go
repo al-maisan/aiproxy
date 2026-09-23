@@ -165,6 +165,7 @@ func TestValidateErrors(t *testing.T) {
 		want   string
 	}{
 		{"empty listen", func(c *Config) { c.Listen = "" }, "listen"},
+		{"blank client token", func(c *Config) { c.ClientToken = "   " }, "client_token"},
 		{"bad log level", func(c *Config) { c.Log.Level = "loud" }, "log.level"},
 		{"bad log format", func(c *Config) { c.Log.Format = "xml" }, "log.format"},
 		{"primary empty name", func(c *Config) { c.Upstreams.Primary.Name = "" }, "upstreams.primary.name"},
@@ -173,6 +174,7 @@ func TestValidateErrors(t *testing.T) {
 		{"primary missing host", func(c *Config) { c.Upstreams.Primary.ChatURL = "http:///y" }, "missing host"},
 		{"primary bad models url", func(c *Config) { c.Upstreams.Primary.ModelsURL = "://" }, "upstreams.primary.models_url"},
 		{"primary empty key", func(c *Config) { c.Upstreams.Primary.APIKey = "" }, "upstreams.primary.api_key"},
+		{"primary empty literal key", func(c *Config) { c.Upstreams.Primary.APIKey = "literal:" }, "upstreams.primary.api_key"},
 		{"fallback empty name", func(c *Config) { c.Upstreams.Fallback.Name = "" }, "upstreams.fallback.name"},
 		{"route empty requested", func(c *Config) { c.Routes = []Route{{Primary: "x"}} }, "routes[0].requested"},
 		{"route empty primary", func(c *Config) { c.Routes = []Route{{Requested: "x"}} }, "routes[0].primary"},
@@ -182,6 +184,7 @@ func TestValidateErrors(t *testing.T) {
 		{"bad quota pattern", func(c *Config) { c.Quota.Patterns = []string{"("} }, "quota.patterns[0]"},
 		{"zero body bytes", func(c *Config) { c.Server.MaxBodyBytes = 0 }, "server.max_body_bytes"},
 		{"zero read header timeout", func(c *Config) { c.Server.ReadHeaderTimeout = 0 }, "server.read_header_timeout"},
+		{"zero body read timeout", func(c *Config) { c.Server.BodyReadTimeout = 0 }, "server.body_read_timeout"},
 		{"zero upstream header timeout", func(c *Config) { c.Server.UpstreamHeaderTimeout = 0 }, "server.upstream_header_timeout"},
 		{"zero dial timeout", func(c *Config) { c.Server.DialTimeout = 0 }, "server.dial_timeout"},
 		{"zero shutdown timeout", func(c *Config) { c.Server.ShutdownTimeout = 0 }, "server.shutdown_timeout"},
@@ -247,6 +250,37 @@ func TestLoadSurfacesValidationErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "listen") {
 		t.Fatalf("error = %v, want mention of listen", err)
+	}
+}
+
+func TestLoadTrimsClientToken(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "listen = \"127.0.0.1:1\"\nclient_token = \"  sekret  \"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ClientToken != "sekret" {
+		t.Fatalf("ClientToken = %q, want trimmed %q", cfg.ClientToken, "sekret")
+	}
+}
+
+func TestLoadRejectsBlankClientToken(t *testing.T) {
+	_, err := Load(writeConfig(t, "listen = \"127.0.0.1:1\"\nclient_token = \"   \"\n"))
+	if err == nil {
+		t.Fatal("expected error for blank client_token")
+	}
+	if !strings.Contains(err.Error(), "client_token") {
+		t.Fatalf("error = %v, want mention of client_token", err)
+	}
+}
+
+func TestValidateRejectsBlankClientTokenWithoutMutating(t *testing.T) {
+	cfg := Default()
+	cfg.ClientToken = "   "
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted a blank client_token")
+	}
+	if cfg.ClientToken != "   " {
+		t.Fatalf("Validate() mutated ClientToken to %q; it must stay pure", cfg.ClientToken)
 	}
 }
 

@@ -138,7 +138,7 @@ func writeAt(t *testing.T, path, content string) {
 
 func TestResolveEmptyComponents(t *testing.T) {
 	r := NewResolver("", 0)
-	for _, spec := range []string{"env:", "file:", "opencode-auth:"} {
+	for _, spec := range []string{"env:", "file:", "opencode-auth:", "literal:"} {
 		if _, err := r.Resolve(spec); err == nil {
 			t.Errorf("Resolve(%q) expected error", spec)
 		}

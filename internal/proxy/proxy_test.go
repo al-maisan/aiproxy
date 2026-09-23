@@ -1,14 +1,20 @@
 package proxy
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/al-maisan/aiproxy/internal/config"
 	"github.com/al-maisan/aiproxy/internal/keys"
@@ -373,6 +379,160 @@ func TestBodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestBodyReadTimeoutReturns408(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Server.BodyReadTimeout = config.Duration(150 * time.Millisecond)
+	srv := newProxy(t, cfg)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Announce more body than we send so the read blocks until the deadline.
+	if _, err := io.WriteString(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n{"); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+}
+
+func TestReadyzLogsOnlyStateTransitions(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_READYZ_TRANSITION_UNSET"
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	for i := 0; i < 5; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", map[string]string{"Authorization": "Bearer t"})
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	got := strings.Count(buf.String(), "upstream key unavailable")
+	if got != 1 {
+		t.Fatalf("logged %d unavailability messages across 5 polls, want 1", got)
+	}
+}
+
+func TestReadyzLogsRecoveryTransition(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The key resolves from a file whose path we can create after the first poll.
+	keyPath := filepath.Join(t.TempDir(), "primary.key")
+
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.APIKey = "file:" + keyPath
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	auth := map[string]string{"Authorization": "Bearer t"}
+
+	// Unavailable: one Warn.
+	for i := 0; i < 3; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages = %d, want 1", got)
+	}
+
+	// Make the key resolvable, then poll again: exactly one recovery Info.
+	if err := os.WriteFile(keyPath, []byte("k\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key available again"); got != 1 {
+		t.Fatalf("recovery messages = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages after recovery = %d, want still 1", got)
+	}
+}
+
+func TestReadyzDuplicateUpstreamNamesDoNotFlood(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Both upstreams share a name; readiness state must still be tracked per
+	// role, otherwise the two entries alias and every poll logs a transition.
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.Name = "dup"
+	cfg.Upstreams.Fallback.Name = "dup"
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_READYZ_DUP_UNSET"
+	cfg.Upstreams.Fallback.APIKey = "literal:fb"
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	auth := map[string]string{"Authorization": "Bearer t"}
+	for i := 0; i < 5; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "upstream key available again"); got != 0 {
+		t.Fatalf("spurious recovery messages = %d, want 0", got)
+	}
+}
+
+func TestForwardFallbackKeyUnavailableMessage(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "primary-served")
+	})
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be reached without a key")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	cfg.Upstreams.Fallback.APIKey = "env:AIPROXY_PROXY_UNSET_FALLBACK"
+	srv := newProxy(t, cfg)
+
+	// Unrouted model goes straight to the fallback, whose key is unresolved.
+	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"other"}`, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if !strings.Contains(body, "api key unavailable") {
+		t.Fatalf("body = %q, want api-key-unavailable message", body)
+	}
+}
+
 func TestInvalidJSON(t *testing.T) {
 	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
 	srv := newProxy(t, cfg)
@@ -528,6 +688,54 @@ func TestCloneWithModel(t *testing.T) {
 	}
 }
 
+func TestPrimaryBodyPreservesLargeIntegers(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "{}")
+	})
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be called")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	srv := newProxy(t, cfg)
+
+	// 9007199254740993 is not representable as float64; it must not be rounded.
+	resp, _ := post(t, srv.URL+"/v1/chat/completions",
+		`{"model":"req-model","seed":9007199254740993}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := string(primary.call(0).body); !strings.Contains(got, "9007199254740993") {
+		t.Fatalf("primary body = %s, want exact seed 9007199254740993", got)
+	}
+}
+
+func TestTrailingJSONRejected(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	srv := newProxy(t, cfg)
+
+	resp, _ := post(t, srv.URL+"/v1/chat/completions",
+		`{"model":"req-model"}{"model":"smuggled"}`, nil)
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestReadyzHidesKeySourceDetail(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	secretPath := "/nonexistent/secret/location/aiproxy.key"
+	cfg.Upstreams.Primary.APIKey = "file:" + secretPath
+	cfg.ClientToken = "t"
+	srv := newProxy(t, cfg)
+
+	resp, body := getWith(t, srv.URL+"/readyz", map[string]string{"Authorization": "Bearer t"})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if strings.Contains(body, secretPath) {
+		t.Fatalf("readyz body leaked key path: %s", body)
+	}
+}
+
 func TestBearerToken(t *testing.T) {
 	tests := map[string]string{
 		"Bearer abc":  "abc",
@@ -569,9 +777,29 @@ func TestNewRequestIDUnique(t *testing.T) {
 	}
 }
 
-func TestPrimaryKeyUnresolvedFallsBack(t *testing.T) {
+func TestPrimaryKeyUnresolvedReturnsBadGateway(t *testing.T) {
 	primary := newFake(t, func(_ http.ResponseWriter, _ int) {
 		t.Error("primary must not be reached without a key")
+	})
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be reached on a missing primary key")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
+	srv := newProxy(t, cfg)
+
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if primary.count() != 0 || fallback.count() != 0 {
+		t.Fatalf("primary=%d fallback=%d, want 0/0", primary.count(), fallback.count())
+	}
+}
+
+func TestPrimaryKeyUnresolvedDoesNotForwardClientAuthorization(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "primary-served")
 	})
 	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
 		_, _ = io.WriteString(w, "fallback-served")
@@ -580,33 +808,13 @@ func TestPrimaryKeyUnresolvedFallsBack(t *testing.T) {
 	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
 	srv := newProxy(t, cfg)
 
-	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
-	if resp.StatusCode != http.StatusOK || body != "fallback-served" {
-		t.Fatalf("status=%d body=%q, want fallback", resp.StatusCode, body)
-	}
-	if primary.count() != 0 || fallback.count() != 1 {
-		t.Fatalf("primary=%d fallback=%d, want 0/1", primary.count(), fallback.count())
-	}
-}
-
-func TestPrimaryKeyUsesClientAuthorization(t *testing.T) {
-	primary := newFake(t, func(w http.ResponseWriter, _ int) {
-		_, _ = io.WriteString(w, "primary-served")
-	})
-	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
-		t.Error("fallback must not be called")
-	})
-	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
-	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
-	srv := newProxy(t, cfg)
-
-	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`,
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`,
 		map[string]string{"Authorization": "Bearer client-token"})
-	if resp.StatusCode != http.StatusOK || body != "primary-served" {
-		t.Fatalf("status=%d body=%q", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
-	if got := primary.call(0).header.Get("Authorization"); got != "Bearer client-token" {
-		t.Fatalf("primary authorization = %q, want client token", got)
+	if primary.count() != 0 || fallback.count() != 0 {
+		t.Fatalf("primary=%d fallback=%d, want 0/0", primary.count(), fallback.count())
 	}
 }
 
@@ -627,7 +835,7 @@ func TestFallbackKeyUnresolvedReturnsBadGateway(t *testing.T) {
 	}
 }
 
-func TestModelsUsesClientAuthorization(t *testing.T) {
+func TestModelsUnresolvedKeyDoesNotForwardClientAuthorization(t *testing.T) {
 	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
 		_, _ = io.WriteString(w, `{"object":"list"}`)
 	})
@@ -636,11 +844,11 @@ func TestModelsUsesClientAuthorization(t *testing.T) {
 	srv := newProxy(t, cfg)
 
 	resp, _ := getWith(t, srv.URL+"/v1/models", map[string]string{"Authorization": "Bearer client-token"})
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
-	if got := fallback.call(0).header.Get("Authorization"); got != "Bearer client-token" {
-		t.Fatalf("models authorization = %q", got)
+	if fallback.count() != 0 {
+		t.Fatalf("fallback calls = %d, want 0", fallback.count())
 	}
 }
 
@@ -745,6 +953,40 @@ func TestCopyRequestHeadersFilters(t *testing.T) {
 	}
 	if dst.Get("X-Keep") != "1" {
 		t.Errorf("X-Keep = %q, want preserved", dst.Get("X-Keep"))
+	}
+}
+
+func TestCopyRequestHeadersDropsConnectionNamed(t *testing.T) {
+	src := http.Header{}
+	src.Set("Connection", "X-Credential, keep-alive")
+	src.Set("X-Credential", "secret")
+	src.Set("X-Keep", "1")
+
+	dst := http.Header{}
+	copyRequestHeaders(dst, src)
+
+	if got := dst.Get("X-Credential"); got != "" {
+		t.Errorf("X-Credential = %q, want dropped (named in Connection)", got)
+	}
+	if dst.Get("X-Keep") != "1" {
+		t.Errorf("X-Keep = %q, want preserved", dst.Get("X-Keep"))
+	}
+}
+
+func TestCopyResponseHeadersDropsConnectionNamed(t *testing.T) {
+	src := http.Header{}
+	src.Set("Connection", "X-Internal")
+	src.Set("X-Internal", "1")
+	src.Set("Content-Type", "application/json")
+
+	dst := http.Header{}
+	copyResponseHeaders(dst, src)
+
+	if got := dst.Get("X-Internal"); got != "" {
+		t.Errorf("X-Internal = %q, want dropped (named in Connection)", got)
+	}
+	if dst.Get("Content-Type") != "application/json" {
+		t.Errorf("Content-Type = %q, want preserved", dst.Get("Content-Type"))
 	}
 }
 
