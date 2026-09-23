@@ -91,8 +91,9 @@ func TestNewRejectsInvalidPattern(t *testing.T) {
 }
 
 // FuzzPatternMatch exercises Match with arbitrary status codes and bodies
-// against the default patterns. Match must not panic and must stay total: any
-// (status, body) pair either classifies or not, without assuming a body shape.
+// against a representative pattern set (mirroring the configured defaults).
+// Match must not panic and must stay total: any (status, body) pair either
+// classifies or not, without assuming a body shape.
 func FuzzPatternMatch(f *testing.F) {
 	d, err := New(nil, []string{
 		`(?i)\bquota\b`,
