@@ -23,6 +23,7 @@ import (
 	"github.com/al-maisan/aiproxy/internal/config"
 	"github.com/al-maisan/aiproxy/internal/keys"
 	"github.com/al-maisan/aiproxy/internal/quota"
+	"github.com/al-maisan/aiproxy/internal/stats"
 )
 
 type ctxKey int
@@ -74,6 +75,7 @@ type Proxy struct {
 	client *http.Client
 	routes map[string]config.Route
 	strip  map[string]struct{}
+	stats  *stats.Collector
 
 	// readyMu guards readyState, the last observed readiness per upstream.
 	// The state is tracked so /readyz can log transitions instead of logging
@@ -108,6 +110,11 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 		strip[f] = struct{}{}
 	}
 
+	collector := stats.New()
+	if len(cfg.Stats.Buckets) > 0 {
+		collector = stats.NewWithBuckets(cfg.Stats.Buckets)
+	}
+
 	return &Proxy{
 		cfg:        cfg,
 		log:        log,
@@ -116,6 +123,7 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 		client:     &http.Client{Transport: transport},
 		routes:     routes,
 		strip:      strip,
+		stats:      collector,
 		readyState: make(map[string]bool),
 	}, nil
 }
@@ -126,10 +134,16 @@ func (p *Proxy) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", p.handleHealth)
 	mux.Handle("GET /readyz", p.instrument(p.authenticate(http.HandlerFunc(p.handleReady))))
 	for _, path := range []string{"/v1/chat/completions", "/chat/completions"} {
-		mux.Handle("POST "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleChat))))
+		mux.Handle("POST "+path, p.instrument(p.chatHandler()))
 	}
 	for _, path := range []string{"/v1/models", "/models"} {
 		mux.Handle("GET "+path, p.instrument(p.authenticate(http.HandlerFunc(p.handleModels))))
+	}
+	if !p.cfg.Stats.Disabled {
+		// Stats are operator-facing, so they require the client token when one
+		// is configured, like the other proxied routes.
+		mux.Handle("GET /stats", p.authenticate(http.HandlerFunc(p.handleStats)))
+		mux.Handle("GET /metrics", p.authenticate(http.HandlerFunc(p.handleMetrics)))
 	}
 	return mux
 }
@@ -175,6 +189,30 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, status, map[string]any{"ready": ready, "checks": checks})
 }
 
+func (p *Proxy) handleStats(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, p.stats.Snapshot())
+}
+
+// chatHandler authenticates and serves a chat request. Unauthorized attempts are
+// recorded as client errors so they appear in the request statistics.
+func (p *Proxy) chatHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !p.authorized(r) {
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusUnauthorized)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
+			p.writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		p.handleChat(w, r)
+	})
+}
+
+func (p *Proxy) handleMetrics(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, p.stats.Prometheus())
+}
+
 // noteReadiness records an upstream's readiness and logs it only when the state
 // changes, so a health checker polling a misconfigured deployment does not
 // flood the logs. State is keyed by role (primary/fallback), not the
@@ -212,13 +250,16 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	_ = r.Body.Close()
 	if err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusRequestTimeout)
 			p.writeError(w, http.StatusRequestTimeout, "request body read timed out")
 			return
 		}
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
 	if int64(len(body)) > p.cfg.Server.MaxBodyBytes {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusRequestEntityTooLarge)
 		p.writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 		return
 	}
@@ -227,15 +268,18 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := dec.Decode(&payload); err != nil {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "invalid JSON request body")
 		return
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "unexpected data after JSON request body")
 		return
 	}
 	model, _ := payload["model"].(string)
 	if strings.TrimSpace(model) == "" {
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.ClientErr, "", http.StatusBadRequest)
 		p.writeError(w, http.StatusBadRequest, "missing model")
 		return
 	}
@@ -245,7 +289,7 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	route, routed := p.routes[model]
 	if !routed {
 		log.Debug("no route for model; using fallback", "upstream", p.cfg.Upstreams.Fallback.Name)
-		p.forwardFallback(w, r, body, log, "unrouted")
+		p.forwardFallback(w, r, body, log, stats.ReasonUnrouted)
 		return
 	}
 
@@ -256,6 +300,7 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 		fallbackBody, err = cloneWithModel(payload, route.FallbackModel(), nil)
 		if err != nil {
 			log.Error("failed to encode fallback request", "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusInternalServerError)
 			p.writeError(w, http.StatusInternalServerError, "failed to encode request")
 			return
 		}
@@ -264,31 +309,38 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	primaryBody, err := p.encodePrimary(payload, route.Primary)
 	if err != nil {
 		log.Error("failed to encode primary request", "err", err)
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusInternalServerError)
 		p.writeError(w, http.StatusInternalServerError, "failed to encode request")
 		return
 	}
 
+	primaryStart := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
 	if err != nil {
+		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("primary api key unavailable", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "primary upstream api key unavailable")
 			return
 		}
 		if !p.cfg.FallbackOnConnErr() {
 			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, "", http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "primary upstream request failed")
 			return
 		}
 		log.Warn("primary unreachable; falling back",
 			"upstream", p.cfg.Upstreams.Primary.Name, "fallback", p.cfg.Upstreams.Fallback.Name, "err", err)
-		p.forwardFallback(w, r, fallbackBody, log, "connection_error")
+		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonConnectionError)
 		return
 	}
+	p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		log.Debug("served by primary", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+		p.stats.ObserveRequest(stats.UpstreamPrimary, stats.Success, "", resp.StatusCode)
 		p.stream(w, resp)
 		return
 	}
@@ -300,27 +352,34 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 			"status", resp.StatusCode,
 			"fallback", p.cfg.Upstreams.Fallback.Name)
 		log.Debug("primary quota response detail", "detail", safeDetail(errBody))
-		p.forwardFallback(w, r, fallbackBody, log, "quota")
+		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonQuota)
 		return
 	}
 
 	log.Warn("primary error; passing through", "upstream", p.cfg.Upstreams.Primary.Name, "status", resp.StatusCode)
+	p.stats.ObserveRequest(stats.UpstreamPrimary, stats.UpstreamErr, "", resp.StatusCode)
 	writeUpstream(w, resp, errBody)
 }
 
 func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
+	start := time.Now()
 	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
 	if err != nil {
+		p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
 		if errors.Is(err, errKeyUnavailable) {
 			log.Error("fallback api key unavailable", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+			p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 			p.writeError(w, http.StatusBadGateway, "fallback upstream api key unavailable")
 			return
 		}
 		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+		p.stats.ObserveRequest(stats.UpstreamNone, stats.Unavailable, reason, http.StatusBadGateway)
 		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
 		return
 	}
+	p.stats.ObserveLatency(stats.UpstreamFallback, time.Since(start))
 	log.Info("served by fallback", "upstream", p.cfg.Upstreams.Fallback.Name, "status", resp.StatusCode, "reason", reason)
+	p.stats.ObserveRequest(stats.UpstreamFallback, outcomeForStatus(resp.StatusCode), reason, resp.StatusCode)
 	defer func() { _ = resp.Body.Close() }()
 	p.stream(w, resp)
 }
@@ -430,6 +489,14 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// outcomeForStatus classifies a final upstream/served status code.
+func outcomeForStatus(status int) stats.Outcome {
+	if status >= 200 && status < 300 {
+		return stats.Success
+	}
+	return stats.UpstreamErr
+}
+
 func (p *Proxy) instrument(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -465,18 +532,25 @@ func (p *Proxy) instrument(next http.Handler) http.Handler {
 
 func (p *Proxy) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p.cfg.ClientToken != "" {
-			// Compare fixed-size digests to avoid a length-dependent branch.
-			got := sha256.Sum256([]byte(bearerToken(r.Header.Get("Authorization"))))
-			want := sha256.Sum256([]byte(p.cfg.ClientToken))
-			if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
-				p.writeError(w, http.StatusUnauthorized, "unauthorized")
-				return
-			}
+		if !p.authorized(r) {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="aiproxy"`)
+			p.writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// authorized reports whether the request carries valid credentials. It is true
+// for every request when no client_token is configured.
+func (p *Proxy) authorized(r *http.Request) bool {
+	if p.cfg.ClientToken == "" {
+		return true
+	}
+	// Compare fixed-size digests to avoid a length-dependent branch.
+	got := sha256.Sum256([]byte(bearerToken(r.Header.Get("Authorization"))))
+	want := sha256.Sum256([]byte(p.cfg.ClientToken))
+	return subtle.ConstantTimeCompare(got[:], want[:]) == 1
 }
 
 type recorder struct {

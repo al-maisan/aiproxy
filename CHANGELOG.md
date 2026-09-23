@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Request statistics: `GET /stats` (JSON) and `GET /metrics` (Prometheus) report
+  per-upstream request counts and percentages, fallback reasons, and latency
+  (sum/avg/min/max, p50/p90/p99, and a Prometheus histogram). Configured via
+  `[stats]` (`disabled`, `buckets`); both endpoints honour `client_token`.
 - `server.body_read_timeout` bounds how long a client may take to send a request
   body, mitigating slow-body connection hoarding.
 - A warning is logged when binding a non-loopback address without `client_token`.
