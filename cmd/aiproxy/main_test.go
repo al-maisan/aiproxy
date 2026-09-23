@@ -303,7 +303,7 @@ func TestIsLoopbackListen(t *testing.T) {
 		"127.0.0.1:8787": true,
 		"127.0.0.1:0":    true,
 		"[::1]:8787":     true,
-		"localhost:8787": false,
+		"localhost:8787": true,
 		"0.0.0.0:8787":   false,
 		":8787":          false,
 		"192.168.1.5:80": false,

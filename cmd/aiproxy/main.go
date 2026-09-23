@@ -190,13 +190,17 @@ func defaultUserConfigPath() string {
 }
 
 // isLoopbackListen reports whether addr binds only to the loopback interface.
+// "localhost" is accepted as loopback by convention.
 func isLoopbackListen(addr string) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
 	}
-	if host == "" || host == "localhost" {
+	if host == "" {
 		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()

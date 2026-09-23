@@ -202,10 +202,28 @@ func Load(path string) (*Config, error) {
 		}
 		return nil, fmt.Errorf("config %s: unknown fields: %s", path, strings.Join(keys, ", "))
 	}
+	if err := cfg.normalize(); err != nil {
+		return nil, fmt.Errorf("config %s: %w", path, err)
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config %s: %w", path, err)
 	}
 	return cfg, nil
+}
+
+// normalize applies canonicalisation that is not validation: currently it trims
+// surrounding whitespace from client_token so it matches the presented value
+// (bearerToken already trims). A token that is blank after trimming is rejected
+// rather than silently disabling authentication.
+func (c *Config) normalize() error {
+	if c.ClientToken != "" {
+		trimmed := strings.TrimSpace(c.ClientToken)
+		if trimmed == "" {
+			return errors.New("client_token: must not be blank")
+		}
+		c.ClientToken = trimmed
+	}
+	return nil
 }
 
 // Validate checks the configuration for errors.
@@ -214,15 +232,6 @@ func (c *Config) Validate() error {
 
 	if strings.TrimSpace(c.Listen) == "" {
 		errs = append(errs, errors.New("listen: must not be empty"))
-	}
-	// Normalise so a token with incidental surrounding whitespace still matches
-	// the presented value, which bearerToken already trims. A token that is
-	// blank after trimming must not silently disable authentication.
-	if c.ClientToken != "" {
-		c.ClientToken = strings.TrimSpace(c.ClientToken)
-		if c.ClientToken == "" {
-			errs = append(errs, errors.New("client_token: must not be blank"))
-		}
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":

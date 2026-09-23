@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -398,6 +399,53 @@ func TestBodyReadTimeoutReturns408(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusRequestTimeout {
 		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+}
+
+func TestReadyzLogsOnlyStateTransitions(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_READYZ_TRANSITION_UNSET"
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	for i := 0; i < 5; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", map[string]string{"Authorization": "Bearer t"})
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	got := strings.Count(buf.String(), "upstream key unavailable")
+	if got != 1 {
+		t.Fatalf("logged %d unavailability messages across 5 polls, want 1", got)
+	}
+}
+
+func TestForwardFallbackKeyUnavailableMessage(t *testing.T) {
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "primary-served")
+	})
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be reached without a key")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	cfg.Upstreams.Fallback.APIKey = "env:AIPROXY_PROXY_UNSET_FALLBACK"
+	srv := newProxy(t, cfg)
+
+	// Unrouted model goes straight to the fallback, whose key is unresolved.
+	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"other"}`, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if !strings.Contains(body, "api key unavailable") {
+		t.Fatalf("body = %q, want api-key-unavailable message", body)
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/al-maisan/aiproxy/internal/config"
@@ -73,6 +74,12 @@ type Proxy struct {
 	client *http.Client
 	routes map[string]config.Route
 	strip  map[string]struct{}
+
+	// readyMu guards readyState, the last observed readiness per upstream.
+	// The state is tracked so /readyz can log transitions instead of logging
+	// on every poll.
+	readyMu    sync.Mutex
+	readyState map[string]bool
 }
 
 // New constructs a Proxy from config. It does not perform any I/O.
@@ -102,13 +109,14 @@ func New(cfg *config.Config, log *slog.Logger, kr *keys.Resolver) (*Proxy, error
 	}
 
 	return &Proxy{
-		cfg:    cfg,
-		log:    log,
-		keys:   kr,
-		quota:  q,
-		client: &http.Client{Transport: transport},
-		routes: routes,
-		strip:  strip,
+		cfg:        cfg,
+		log:        log,
+		keys:       kr,
+		quota:      q,
+		client:     &http.Client{Transport: transport},
+		routes:     routes,
+		strip:      strip,
+		readyState: make(map[string]bool),
 	}, nil
 }
 
@@ -145,12 +153,12 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 		if _, err := p.keys.Resolve(up.APIKey); err != nil {
 			// Keep the diagnostic server-side: it may name local paths or
 			// environment variables that should not be disclosed to clients.
-			// Warn, not Error: a health checker polls this repeatedly while a
-			// key is missing and must not flood the logs.
-			p.log.Warn("readiness key resolution failed", "upstream", up.Name, "err", err)
 			c.OK = false
 			c.Error = "api key unavailable"
 			ready = false
+			p.noteReadiness(up.Name, false, err)
+		} else {
+			p.noteReadiness(up.Name, true, nil)
 		}
 		checks = append(checks, c)
 	}
@@ -159,6 +167,27 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, map[string]any{"ready": ready, "checks": checks})
+}
+
+// noteReadiness records an upstream's readiness and logs it only when the state
+// changes, so a health checker polling a misconfigured deployment does not
+// flood the logs.
+func (p *Proxy) noteReadiness(upstream string, ok bool, err error) {
+	p.readyMu.Lock()
+	prev, seen := p.readyState[upstream]
+	p.readyState[upstream] = ok
+	p.readyMu.Unlock()
+
+	switch {
+	case !seen && ok:
+		// First successful check: nothing to report.
+	case !seen || prev != ok:
+		if ok {
+			p.log.Info("upstream key available again", "upstream", upstream)
+		} else {
+			p.log.Warn("upstream key unavailable", "upstream", upstream, "err", err)
+		}
+	}
 }
 
 func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +224,7 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		p.writeError(w, http.StatusBadRequest, "invalid JSON request body")
+		p.writeError(w, http.StatusBadRequest, "unexpected data after JSON request body")
 		return
 	}
 	model, _ := payload["model"].(string)
@@ -275,6 +304,11 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) forwardFallback(w http.ResponseWriter, r *http.Request, body []byte, log *slog.Logger, reason string) {
 	resp, err := p.forward(r, p.cfg.Upstreams.Fallback, body)
 	if err != nil {
+		if errors.Is(err, errKeyUnavailable) {
+			log.Error("fallback api key unavailable", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
+			p.writeError(w, http.StatusBadGateway, "fallback upstream api key unavailable")
+			return
+		}
 		log.Error("fallback request failed", "upstream", p.cfg.Upstreams.Fallback.Name, "reason", reason, "err", err)
 		p.writeError(w, http.StatusBadGateway, "fallback upstream request failed")
 		return
@@ -524,10 +558,15 @@ func copyResponseHeaders(dst, src http.Header) {
 }
 
 // connectionNamedHeaders returns the lower-cased names listed in the
-// Connection header, which RFC 7230 §6.1 makes hop-by-hop.
+// Connection header, which RFC 7230 §6.1 makes hop-by-hop. It returns nil when
+// there is no Connection header, avoiding an allocation on the common path.
 func connectionNamedHeaders(h http.Header) map[string]struct{} {
+	values := h.Values("Connection")
+	if len(values) == 0 {
+		return nil
+	}
 	out := make(map[string]struct{})
-	for _, v := range h.Values("Connection") {
+	for _, v := range values {
 		for _, name := range strings.Split(v, ",") {
 			if name = strings.ToLower(strings.TrimSpace(name)); name != "" {
 				out[name] = struct{}{}

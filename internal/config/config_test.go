@@ -252,21 +252,18 @@ func TestLoadSurfacesValidationErrors(t *testing.T) {
 	}
 }
 
-func TestValidateTrimsClientToken(t *testing.T) {
-	cfg := Default()
-	cfg.ClientToken = "  sekret  "
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
+func TestLoadTrimsClientToken(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "listen = \"127.0.0.1:1\"\nclient_token = \"  sekret  \"\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
 	}
 	if cfg.ClientToken != "sekret" {
 		t.Fatalf("ClientToken = %q, want trimmed %q", cfg.ClientToken, "sekret")
 	}
 }
 
-func TestValidateRejectsBlankClientToken(t *testing.T) {
-	cfg := Default()
-	cfg.ClientToken = "   "
-	err := cfg.Validate()
+func TestLoadRejectsBlankClientToken(t *testing.T) {
+	_, err := Load(writeConfig(t, "listen = \"127.0.0.1:1\"\nclient_token = \"   \"\n"))
 	if err == nil {
 		t.Fatal("expected error for blank client_token")
 	}
