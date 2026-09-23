@@ -148,17 +148,23 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 	}
 	checks := make([]check, 0, 2)
 	ready := true
-	for _, up := range []config.Upstream{p.cfg.Upstreams.Primary, p.cfg.Upstreams.Fallback} {
-		c := check{Upstream: up.Name, OK: true}
-		if _, err := p.keys.Resolve(up.APIKey); err != nil {
+	for _, u := range []struct {
+		role, name string
+		up         config.Upstream
+	}{
+		{"primary", p.cfg.Upstreams.Primary.Name, p.cfg.Upstreams.Primary},
+		{"fallback", p.cfg.Upstreams.Fallback.Name, p.cfg.Upstreams.Fallback},
+	} {
+		c := check{Upstream: u.name, OK: true}
+		if _, err := p.keys.Resolve(u.up.APIKey); err != nil {
 			// Keep the diagnostic server-side: it may name local paths or
 			// environment variables that should not be disclosed to clients.
 			c.OK = false
 			c.Error = "api key unavailable"
 			ready = false
-			p.noteReadiness(up.Name, false, err)
+			p.noteReadiness(u.role, u.name, false, err)
 		} else {
-			p.noteReadiness(up.Name, true, nil)
+			p.noteReadiness(u.role, u.name, true, nil)
 		}
 		checks = append(checks, c)
 	}
@@ -171,11 +177,12 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 
 // noteReadiness records an upstream's readiness and logs it only when the state
 // changes, so a health checker polling a misconfigured deployment does not
-// flood the logs.
-func (p *Proxy) noteReadiness(upstream string, ok bool, err error) {
+// flood the logs. State is keyed by role (primary/fallback), not the
+// operator-supplied name, which the two upstreams may share.
+func (p *Proxy) noteReadiness(role, name string, ok bool, err error) {
 	p.readyMu.Lock()
-	prev, seen := p.readyState[upstream]
-	p.readyState[upstream] = ok
+	prev, seen := p.readyState[role]
+	p.readyState[role] = ok
 	p.readyMu.Unlock()
 
 	switch {
@@ -183,9 +190,9 @@ func (p *Proxy) noteReadiness(upstream string, ok bool, err error) {
 		// First successful check: nothing to report.
 	case !seen || prev != ok:
 		if ok {
-			p.log.Info("upstream key available again", "upstream", upstream)
+			p.log.Info("upstream key available again", "upstream", name)
 		} else {
-			p.log.Warn("upstream key unavailable", "upstream", upstream, "err", err)
+			p.log.Warn("upstream key unavailable", "upstream", name, "err", err)
 		}
 	}
 }

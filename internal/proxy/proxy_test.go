@@ -478,6 +478,40 @@ func TestReadyzLogsRecoveryTransition(t *testing.T) {
 	}
 }
 
+func TestReadyzDuplicateUpstreamNamesDoNotFlood(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// Both upstreams share a name; readiness state must still be tracked per
+	// role, otherwise the two entries alias and every poll logs a transition.
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.Name = "dup"
+	cfg.Upstreams.Fallback.Name = "dup"
+	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_READYZ_DUP_UNSET"
+	cfg.Upstreams.Fallback.APIKey = "literal:fb"
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	auth := map[string]string{"Authorization": "Bearer t"}
+	for i := 0; i < 5; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "upstream key available again"); got != 0 {
+		t.Fatalf("spurious recovery messages = %d, want 0", got)
+	}
+}
+
 func TestForwardFallbackKeyUnavailableMessage(t *testing.T) {
 	primary := newFake(t, func(w http.ResponseWriter, _ int) {
 		_, _ = io.WriteString(w, "primary-served")
