@@ -337,11 +337,16 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if p.quota.IsQuota(resp.StatusCode, errBody) {
+	if reason, ok := p.quota.Match(resp.StatusCode, errBody); ok {
+		// Log which configured rule matched (status code or pattern) at Warn:
+		// it is leak-free and answers "was this really quota?" without dropping
+		// to Debug. The raw body stays at Debug, since a provider 400 may echo
+		// request content.
 		log.Warn("primary quota reached; falling back",
 			"upstream", p.cfg.Upstreams.Primary.Name,
 			"status", resp.StatusCode,
-			"fallback", p.cfg.Upstreams.Fallback.Name)
+			"fallback", p.cfg.Upstreams.Fallback.Name,
+			"matched", reason.String())
 		log.Debug("primary quota response detail", "detail", safeDetail(errBody))
 		p.stats.ObserveLatency(stats.UpstreamPrimary, time.Since(primaryStart))
 		p.forwardFallback(w, r, fallbackBody, log, stats.ReasonQuota)
