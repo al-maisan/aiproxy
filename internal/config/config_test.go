@@ -173,6 +173,7 @@ func TestValidateErrors(t *testing.T) {
 		{"primary missing host", func(c *Config) { c.Upstreams.Primary.ChatURL = "http:///y" }, "missing host"},
 		{"primary bad models url", func(c *Config) { c.Upstreams.Primary.ModelsURL = "://" }, "upstreams.primary.models_url"},
 		{"primary empty key", func(c *Config) { c.Upstreams.Primary.APIKey = "" }, "upstreams.primary.api_key"},
+		{"primary empty literal key", func(c *Config) { c.Upstreams.Primary.APIKey = "literal:" }, "upstreams.primary.api_key"},
 		{"fallback empty name", func(c *Config) { c.Upstreams.Fallback.Name = "" }, "upstreams.fallback.name"},
 		{"route empty requested", func(c *Config) { c.Routes = []Route{{Primary: "x"}} }, "routes[0].requested"},
 		{"route empty primary", func(c *Config) { c.Routes = []Route{{Requested: "x"}} }, "routes[0].primary"},
@@ -259,6 +260,18 @@ func TestValidateTrimsClientToken(t *testing.T) {
 	}
 	if cfg.ClientToken != "sekret" {
 		t.Fatalf("ClientToken = %q, want trimmed %q", cfg.ClientToken, "sekret")
+	}
+}
+
+func TestValidateRejectsBlankClientToken(t *testing.T) {
+	cfg := Default()
+	cfg.ClientToken = "   "
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for blank client_token")
+	}
+	if !strings.Contains(err.Error(), "client_token") {
+		t.Fatalf("error = %v, want mention of client_token", err)
 	}
 }
 

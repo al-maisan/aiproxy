@@ -216,8 +216,14 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("listen: must not be empty"))
 	}
 	// Normalise so a token with incidental surrounding whitespace still matches
-	// the presented value, which bearerToken already trims.
-	c.ClientToken = strings.TrimSpace(c.ClientToken)
+	// the presented value, which bearerToken already trims. A token that is
+	// blank after trimming must not silently disable authentication.
+	if c.ClientToken != "" {
+		c.ClientToken = strings.TrimSpace(c.ClientToken)
+		if c.ClientToken == "" {
+			errs = append(errs, errors.New("client_token: must not be blank"))
+		}
+	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":
 	default:
@@ -285,6 +291,8 @@ func validateUpstream(field string, u Upstream) []error {
 	}
 	if strings.TrimSpace(u.APIKey) == "" {
 		errs = append(errs, fmt.Errorf("%s.api_key: must not be empty", field))
+	} else if strings.TrimSpace(u.APIKey) == "literal:" {
+		errs = append(errs, fmt.Errorf("%s.api_key: literal: must have a value", field))
 	}
 	return errs
 }

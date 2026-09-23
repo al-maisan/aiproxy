@@ -1,14 +1,17 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/json"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/al-maisan/aiproxy/internal/config"
 	"github.com/al-maisan/aiproxy/internal/keys"
@@ -373,6 +376,31 @@ func TestBodyTooLarge(t *testing.T) {
 	}
 }
 
+func TestBodyReadTimeoutReturns408(t *testing.T) {
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Server.BodyReadTimeout = config.Duration(150 * time.Millisecond)
+	srv := newProxy(t, cfg)
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	// Announce more body than we send so the read blocks until the deadline.
+	if _, err := io.WriteString(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 1000\r\n\r\n{"); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+}
+
 func TestInvalidJSON(t *testing.T) {
 	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
 	srv := newProxy(t, cfg)
@@ -617,23 +645,23 @@ func TestNewRequestIDUnique(t *testing.T) {
 	}
 }
 
-func TestPrimaryKeyUnresolvedFallsBack(t *testing.T) {
+func TestPrimaryKeyUnresolvedReturnsBadGateway(t *testing.T) {
 	primary := newFake(t, func(_ http.ResponseWriter, _ int) {
 		t.Error("primary must not be reached without a key")
 	})
-	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
-		_, _ = io.WriteString(w, "fallback-served")
+	fallback := newFake(t, func(_ http.ResponseWriter, _ int) {
+		t.Error("fallback must not be reached on a missing primary key")
 	})
 	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
 	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
 	srv := newProxy(t, cfg)
 
-	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
-	if resp.StatusCode != http.StatusOK || body != "fallback-served" {
-		t.Fatalf("status=%d body=%q, want fallback", resp.StatusCode, body)
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
-	if primary.count() != 0 || fallback.count() != 1 {
-		t.Fatalf("primary=%d fallback=%d, want 0/1", primary.count(), fallback.count())
+	if primary.count() != 0 || fallback.count() != 0 {
+		t.Fatalf("primary=%d fallback=%d, want 0/0", primary.count(), fallback.count())
 	}
 }
 
@@ -648,16 +676,13 @@ func TestPrimaryKeyUnresolvedDoesNotForwardClientAuthorization(t *testing.T) {
 	cfg.Upstreams.Primary.APIKey = "env:AIPROXY_PROXY_UNSET_PRIMARY"
 	srv := newProxy(t, cfg)
 
-	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`,
+	resp, _ := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`,
 		map[string]string{"Authorization": "Bearer client-token"})
-	if resp.StatusCode != http.StatusOK || body != "fallback-served" {
-		t.Fatalf("status=%d body=%q, want fallback-served", resp.StatusCode, body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
-	if primary.count() != 0 {
-		t.Fatalf("primary calls = %d, want 0", primary.count())
-	}
-	if got := fallback.call(0).header.Get("Authorization"); got != "Bearer fallback-key" {
-		t.Fatalf("fallback authorization = %q, want its own key, client token must not be forwarded", got)
+	if primary.count() != 0 || fallback.count() != 0 {
+		t.Fatalf("primary=%d fallback=%d, want 0/0", primary.count(), fallback.count())
 	}
 }
 

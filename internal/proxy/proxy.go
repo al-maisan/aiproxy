@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -56,6 +57,11 @@ var requestHeaderDenylist = map[string]struct{}{
 var responseHeaderDenylist = map[string]struct{}{
 	"set-cookie": {},
 }
+
+// errKeyUnavailable marks a failure to resolve an upstream API key. It is
+// distinct from a transport error so callers do not trigger a fallback: a
+// missing key is a configuration problem, not an unreachable upstream.
+var errKeyUnavailable = errors.New("api key unavailable")
 
 // Proxy is an http.Handler that prefers the primary upstream for routed models
 // and transparently falls back to the fallback upstream on quota exhaustion.
@@ -139,7 +145,9 @@ func (p *Proxy) handleReady(w http.ResponseWriter, _ *http.Request) {
 		if _, err := p.keys.Resolve(up.APIKey); err != nil {
 			// Keep the diagnostic server-side: it may name local paths or
 			// environment variables that should not be disclosed to clients.
-			p.log.Error("readiness key resolution failed", "upstream", up.Name, "err", err)
+			// Warn, not Error: a health checker polls this repeatedly while a
+			// key is missing and must not flood the logs.
+			p.log.Warn("readiness key resolution failed", "upstream", up.Name, "err", err)
 			c.OK = false
 			c.Error = "api key unavailable"
 			ready = false
@@ -167,6 +175,10 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, p.cfg.Server.MaxBodyBytes+1))
 	_ = r.Body.Close()
 	if err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			p.writeError(w, http.StatusRequestTimeout, "request body read timed out")
+			return
+		}
 		p.writeError(w, http.StatusBadRequest, "failed to read request body")
 		return
 	}
@@ -222,6 +234,11 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.forward(r, p.cfg.Upstreams.Primary, primaryBody)
 	if err != nil {
+		if errors.Is(err, errKeyUnavailable) {
+			log.Error("primary api key unavailable", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
+			p.writeError(w, http.StatusBadGateway, "primary upstream api key unavailable")
+			return
+		}
 		if !p.cfg.FallbackOnConnErr() {
 			log.Error("primary request failed", "upstream", p.cfg.Upstreams.Primary.Name, "err", err)
 			p.writeError(w, http.StatusBadGateway, "primary upstream request failed")
@@ -325,7 +342,7 @@ func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte
 
 	key, err := p.keys.Resolve(up.APIKey)
 	if err != nil {
-		return nil, fmt.Errorf("resolve API key for %s: %w", up.Name, err)
+		return nil, fmt.Errorf("%w: %s: %w", errKeyUnavailable, up.Name, err)
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	return p.client.Do(req)
