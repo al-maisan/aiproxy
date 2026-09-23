@@ -165,6 +165,7 @@ func TestValidateErrors(t *testing.T) {
 		want   string
 	}{
 		{"empty listen", func(c *Config) { c.Listen = "" }, "listen"},
+		{"blank client token", func(c *Config) { c.ClientToken = "   " }, "client_token"},
 		{"bad log level", func(c *Config) { c.Log.Level = "loud" }, "log.level"},
 		{"bad log format", func(c *Config) { c.Log.Format = "xml" }, "log.format"},
 		{"primary empty name", func(c *Config) { c.Upstreams.Primary.Name = "" }, "upstreams.primary.name"},
@@ -269,6 +270,17 @@ func TestLoadRejectsBlankClientToken(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "client_token") {
 		t.Fatalf("error = %v, want mention of client_token", err)
+	}
+}
+
+func TestValidateRejectsBlankClientTokenWithoutMutating(t *testing.T) {
+	cfg := Default()
+	cfg.ClientToken = "   "
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate() accepted a blank client_token")
+	}
+	if cfg.ClientToken != "   " {
+		t.Fatalf("Validate() mutated ClientToken to %q; it must stay pure", cfg.ClientToken)
 	}
 }
 

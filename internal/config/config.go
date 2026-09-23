@@ -213,15 +213,20 @@ func Load(path string) (*Config, error) {
 
 // normalize applies canonicalisation that is not validation: currently it trims
 // surrounding whitespace from client_token so it matches the presented value
-// (bearerToken already trims). A token that is blank after trimming is rejected
-// rather than silently disabling authentication.
+// (bearerToken already trims).
 func (c *Config) normalize() error {
-	if c.ClientToken != "" {
-		trimmed := strings.TrimSpace(c.ClientToken)
-		if trimmed == "" {
-			return errors.New("client_token: must not be blank")
-		}
-		c.ClientToken = trimmed
+	if err := c.checkClientToken(); err != nil {
+		return err
+	}
+	c.ClientToken = strings.TrimSpace(c.ClientToken)
+	return nil
+}
+
+// checkClientToken rejects a client_token that is present but blank. Such a
+// token would be trimmed to "" and silently disable authentication.
+func (c *Config) checkClientToken() error {
+	if c.ClientToken != "" && strings.TrimSpace(c.ClientToken) == "" {
+		return errors.New("client_token: must not be blank")
 	}
 	return nil
 }
@@ -232,6 +237,9 @@ func (c *Config) Validate() error {
 
 	if strings.TrimSpace(c.Listen) == "" {
 		errs = append(errs, errors.New("listen: must not be empty"))
+	}
+	if err := c.checkClientToken(); err != nil {
+		errs = append(errs, err)
 	}
 	switch c.Log.Level {
 	case "debug", "info", "warn", "error":

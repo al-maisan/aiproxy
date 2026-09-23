@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -425,6 +427,54 @@ func TestReadyzLogsOnlyStateTransitions(t *testing.T) {
 	got := strings.Count(buf.String(), "upstream key unavailable")
 	if got != 1 {
 		t.Fatalf("logged %d unavailability messages across 5 polls, want 1", got)
+	}
+}
+
+func TestReadyzLogsRecoveryTransition(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The key resolves from a file whose path we can create after the first poll.
+	keyPath := filepath.Join(t.TempDir(), "primary.key")
+
+	cfg := testConfig(t, "http://primary.test/chat", "http://fallback.test")
+	cfg.Upstreams.Primary.APIKey = "file:" + keyPath
+	cfg.ClientToken = "t"
+	p, err := New(cfg, log, keys.NewResolver("", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(p.Handler())
+	t.Cleanup(srv.Close)
+
+	auth := map[string]string{"Authorization": "Bearer t"}
+
+	// Unavailable: one Warn.
+	for i := 0; i < 3; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages = %d, want 1", got)
+	}
+
+	// Make the key resolvable, then poll again: exactly one recovery Info.
+	if err := os.WriteFile(keyPath, []byte("k\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		resp, _ := getWith(t, srv.URL+"/readyz", auth)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200", resp.StatusCode)
+		}
+	}
+	if got := strings.Count(buf.String(), "upstream key available again"); got != 1 {
+		t.Fatalf("recovery messages = %d, want 1", got)
+	}
+	if got := strings.Count(buf.String(), "upstream key unavailable"); got != 1 {
+		t.Fatalf("unavailable messages after recovery = %d, want still 1", got)
 	}
 }
 
