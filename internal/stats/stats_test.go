@@ -102,6 +102,33 @@ func TestPercentServedFromServedNotAttempts(t *testing.T) {
 	}
 }
 
+func TestSnapshotIsolatedFromConcurrentObserve(_ *testing.T) {
+	// A snapshot must not share the live counts slice with the collector: a
+	// concurrent ObserveLatency would otherwise race with rendering. Run with
+	// -race to catch a regression.
+	c := NewWithBuckets([]float64{1, 2, 5})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.ObserveLatency(UpstreamPrimary, time.Millisecond)
+			}
+		}
+	}()
+
+	for i := 0; i < 2000; i++ {
+		_ = c.Snapshot()
+		_ = c.Prometheus()
+	}
+	close(stop)
+	<-done
+}
+
 func TestPrometheusFormat(t *testing.T) {
 	c := NewWithBuckets([]float64{1, 5})
 	c.ObserveRequest(UpstreamFallback, Success, ReasonUnrouted, 200)

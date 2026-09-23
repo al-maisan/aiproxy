@@ -3,12 +3,16 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/al-maisan/aiproxy/internal/config"
 	"github.com/al-maisan/aiproxy/internal/stats"
 )
 
@@ -273,6 +277,141 @@ func TestStatsRecordsClientAbort(t *testing.T) {
 	if got := requestCountFor(snap, stats.UpstreamFallback, stats.ReasonConnectionError); got != 0 {
 		t.Fatalf("client abort recorded as connection_error fallback: %d", got)
 	}
+}
+
+func TestClientGoneDistinguishesUpstreamTimeout(t *testing.T) {
+	upstreamTimeout := &httpError{"net/http: timeout awaiting response headers"}
+
+	// Live request context: an upstream timeout is NOT a client abort.
+	live := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", http.NoBody)
+	if clientGone(live, upstreamTimeout) {
+		t.Error("upstream timeout with a live context reported as clientGone")
+	}
+	if clientGone(live, context.DeadlineExceeded) {
+		t.Error("upstream deadline with a live context reported as clientGone")
+	}
+	if clientGone(live, nil) {
+		t.Error("nil error with a live context reported as clientGone")
+	}
+
+	// Cancelled request context (client hung up): treated as client gone.
+	cancelled := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", http.NoBody)
+	cctx, cancel := context.WithCancel(cancelled.Context())
+	cancel()
+	cancelled = cancelled.WithContext(cctx)
+	if !clientGone(cancelled, context.Canceled) {
+		t.Error("cancelled context not reported as clientGone")
+	}
+	if !clientGone(cancelled, nil) {
+		t.Error("cancelled context with nil error not reported as clientGone")
+	}
+	// A transport error wrapping context.Canceled is also a client abort.
+	wrapped := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", http.NoBody)
+	wctx, wcancel := context.WithCancel(wrapped.Context())
+	wcancel()
+	wrapped = wrapped.WithContext(wctx)
+	if !clientGone(wrapped, fmt.Errorf("do: %w", context.Canceled)) {
+		t.Error("wrapped context.Canceled not reported as clientGone")
+	}
+}
+
+// httpError is a minimal error that does not wrap context errors, standing in
+// for an upstream transport timeout.
+type httpError struct{ msg string }
+
+func (e *httpError) Error() string { return e.msg }
+
+func TestStatsUpstreamTimeoutIsNotClientAbort(t *testing.T) {
+	// Primary stalls past the upstream header timeout; the client stays
+	// connected, so this is an upstream failure (with fallback), not an abort.
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		time.Sleep(500 * time.Millisecond)
+		_, _ = io.WriteString(w, "too late")
+	})
+	fallback := newFake(t, func(w http.ResponseWriter, _ int) {
+		_, _ = io.WriteString(w, "fallback-ok")
+	})
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	cfg.Server.UpstreamHeaderTimeout = config.Duration(100 * time.Millisecond)
+	srv := newProxy(t, cfg)
+
+	resp, body := post(t, srv.URL+"/v1/chat/completions", `{"model":"req-model"}`, nil)
+	if resp.StatusCode != http.StatusOK || body != "fallback-ok" {
+		t.Fatalf("status=%d body=%q, want fallback-ok", resp.StatusCode, body)
+	}
+
+	snap := statsSnapshot(t, srv.URL)
+	for _, r := range snap.Requests {
+		if r.Outcome == string(stats.ClientAbort) {
+			t.Fatalf("upstream timeout misrecorded as client_abort: %+v", r)
+		}
+	}
+	if got := requestCountFor(snap, stats.UpstreamFallback, stats.ReasonConnectionError); got != 1 {
+		t.Fatalf("fallback connection_error count = %d, want 1", got)
+	}
+	// The primary attempt must be recorded (a request was actually sent).
+	found := false
+	for _, u := range snap.Upstreams {
+		if u.Upstream == stats.UpstreamPrimary && u.Attempts == 1 {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("primary attempt not recorded: %+v", snap.Upstreams)
+	}
+}
+
+func TestStatsRecordsMidStreamClientAbort(t *testing.T) {
+	// The upstream returns 200 and streams slowly; the client disconnects
+	// mid-stream. The write to the client fails, which is not a context error,
+	// so stream() must signal it explicitly.
+	primary := newFake(t, func(w http.ResponseWriter, _ int) {
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < 20; i++ {
+			if _, err := io.WriteString(w, "data: chunk\n\n"); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(40 * time.Millisecond)
+		}
+	})
+	fallback := newFake(t, nil)
+	cfg := testConfig(t, primary.server.URL+"/chat/completions", fallback.server.URL)
+	srv := newProxy(t, cfg)
+
+	// Raw connection so we can close it after the first bytes arrive.
+	conn, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"model":"req-model"}`
+	req := "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n" +
+		"Content-Type: application/json\r\n" +
+		fmt.Sprintf("Content-Length: %d\r\n\r\n%s", len(body), body)
+	if _, err := io.WriteString(conn, req); err != nil {
+		t.Fatal(err)
+	}
+	// Read a little (headers + first chunk), then hang up.
+	buf := make([]byte, 64)
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, _ = conn.Read(buf)
+	_ = conn.Close()
+
+	// Allow the proxy to observe the broken pipe and record it.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snap := statsSnapshot(t, srv.URL)
+		for _, r := range snap.Requests {
+			if r.Outcome == string(stats.ClientAbort) {
+				return // recorded correctly
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	snap := statsSnapshot(t, srv.URL)
+	t.Fatalf("mid-stream abort not recorded as client_abort: %+v", snap.Requests)
 }
 
 func TestStatsRequiresAuthWhenTokenSet(t *testing.T) {

@@ -361,8 +361,9 @@ func (p *Proxy) handleChat(w http.ResponseWriter, r *http.Request) {
 // finishStream streams resp to the client, then records the attempt latency and
 // the final outcome. Latency is recorded after the body has been copied, so a
 // long SSE response is timed to completion rather than to first byte. The
-// outcome is ClientAbort if the client disconnected mid-stream, UpstreamErr if
-// the upstream body failed, and Success only when the body completed.
+// outcome is ClientAbort if the client disconnected (its context is cancelled
+// or the write to it failed), UpstreamErr if the upstream body failed, and
+// Success only when the body completed.
 func (p *Proxy) finishStream(w http.ResponseWriter, r *http.Request, resp *http.Response, start time.Time, upstream, reason string, log *slog.Logger) {
 	err := p.stream(w, resp)
 	p.stats.ObserveLatency(upstream, time.Since(start))
@@ -372,7 +373,7 @@ func (p *Proxy) finishStream(w http.ResponseWriter, r *http.Request, resp *http.
 	switch {
 	case err == nil && ok:
 		p.stats.ObserveRequest(upstream, stats.Success, reason, status)
-	case err != nil && clientGone(r, err):
+	case errors.Is(err, errClientWrite) || (err != nil && clientGone(r, err)):
 		log.Info("client aborted while streaming", "upstream", upstream)
 		p.stats.ObserveRequest(upstream, stats.ClientAbort, reason, status)
 	default:
@@ -473,9 +474,13 @@ func (p *Proxy) forward(clientReq *http.Request, up config.Upstream, body []byte
 	return p.client.Do(req)
 }
 
+// errClientWrite marks a failure to write to the client's response. It is
+// distinct from an upstream read error: the client is gone, not the upstream.
+var errClientWrite = errors.New("client write failed")
+
 // stream copies the upstream response body to the client. It returns nil only
-// when the body was fully consumed; a read error (upstream) or write error
-// (client) is returned.
+// when the body was fully consumed; a failed read is returned as an upstream
+// error, and a failed write is wrapped in errClientWrite.
 func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) error {
 	copyResponseHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
@@ -486,7 +491,7 @@ func (p *Proxy) stream(w http.ResponseWriter, resp *http.Response) error {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
-				return werr
+				return fmt.Errorf("%w: %w", errClientWrite, werr)
 			}
 			if flusher != nil {
 				flusher.Flush()

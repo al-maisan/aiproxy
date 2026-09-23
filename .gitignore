@@ -2,5 +2,6 @@
 /dist/
 /coverage.out
 *.test
+/aiproxy
 aiproxy.toml
 .env

@@ -222,8 +222,12 @@ func (c *Collector) snapshot() view {
 		}
 		return a.status < b.status
 	})
+	// Deep-copy each histogram, including its counts slice: the snapshot is
+	// read after the lock is released, and observe() mutates counts in place.
 	for u, h := range c.hists {
-		v.hists[u] = *h
+		hc := *h
+		hc.counts = append([]uint64(nil), h.counts...)
+		v.hists[u] = hc
 	}
 	return v
 }
